@@ -1,28 +1,35 @@
-# 虚拟环境
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
 .venv/
 venv/
 env/
 
-# IDE 配置
+# ---- 程序运行产物 ----
+output/
+logs/
+*.log
+
+# ---- 用户配置（含连接信息，勿提交） ----
+config/user_config.json
+
+# ---- 企业敏感资料（模板含公司信息，切勿上传） ----
+2026版新修订企业财务报模板.xls
+*.xls
+*.xlsx
+
+# ---- 打包产物 ----
+build/
+dist/
+*.spec
+
+# ---- IDE ----
 .idea/
 .vscode/
+*.swp
 
-# Python 缓存
-__pycache__/
-*.py[cod]
-*.egg-info/
-.pytest_cache/
-
-# 环境变量与敏感信息
-.env
-*.key
-*.pem
-credentials.json
-
-# 操作系统
-.DS_Store
-Thumbs.db
-
-# 日志与临时文件
-*.log
+# ---- 临时文件 ----
+~$*.xls
+~$*.xlsx
 *.tmp
