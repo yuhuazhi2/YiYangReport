@@ -33,7 +33,7 @@ from typing import Callable, Optional
 
 from config.settings import AppConfig
 from core.context import Period, ReportContext
-from core.db import Database
+from core.db import Database, _brief_error
 from core.excel_engine import ExcelEngine, ExcelEngineError
 from core.logging_setup import get_logger
 from core.template import SheetInfo, TemplateParser
@@ -215,8 +215,13 @@ class ReportGenerator:
                         #   记录错误、跳过本张、继续下一张。
                         #   43 张表里坏 1 张，不该让另外 42 张也白干。
                         #   exc_info=True 会把完整调用栈写进日志，便于定位。
+                        #
+                        # 【重要：界面只放"简化后的原因"】
+                        #   完整原始异常只进 logs/app.log（下面这行 logger.error）；
+                        #   而 result.failed 里的文字最终会显示在界面【运行日志】上，
+                        #   所以必须先过一道 _brief_error，去掉表名、SQL、驱动噪声。
                         logger.error("[%s] 生成失败：%s", rep.code, exc, exc_info=True)
-                        result.failed[rep.code] = str(exc)
+                        result.failed[rep.code] = _brief_error(exc)
 
                 # ===== 第7步：另存为新文件 =====
                 self._report(total, total, "", "正在保存文件…")
@@ -242,8 +247,10 @@ class ReportGenerator:
 
         except ExcelEngineError as exc:
             # 只捕获"Excel 引擎"这一类错误（比如没装 Excel、保存失败）
-            result.message = f"Excel 引擎错误：{exc}"
-            logger.error(result.message)
+            # 【重要】message 会显示在界面与弹窗上，所以同样走一遍简化，
+            #        完整原文仍由下面这行 logger.error 留在 app.log 里。
+            result.message = f"Excel 引擎错误：{_brief_error(exc)}"
+            logger.error("Excel 引擎错误：%s", exc, exc_info=True)
         finally:
             # 【重要】无论成功失败，都要关闭数据库连接，避免连接泄漏。
             db.close()

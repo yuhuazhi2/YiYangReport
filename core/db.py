@@ -26,6 +26,7 @@ from __future__ import annotations
 
 # typing 用于"类型提示"，不是强制的，但能让编辑器帮你检查错误、代码更易读
 from typing import Any, Iterable, Optional, Sequence
+import re
 import time
 
 from config.settings import ConnectionConfig, list_sqlserver_drivers
@@ -42,6 +43,65 @@ try:
     import pyodbc
 except ImportError:  # 便于无驱动的环境导入本模块做静态检查
     pyodbc = None  # type: ignore
+
+
+# 【新手必学：为什么要写这个"错误信息简化"函数？】
+#   数据库驱动（pyodbc）抛出的原始异常往往又长又技术化，例如：
+#     "('42000', "[42000] [Microsoft][ODBC Driver 17 for SQL Server]
+#      [SQL Server]对象名 'GL_accvch' 无效。 (208) (SQLExecDirectW)")
+#   这类文本会原样冒到界面弹窗和【运行日志】里，财务人员看不懂，
+#   而且会顺带暴露表名（GL_accvch）等内部结构信息。
+#
+#   所以这里做一层"翻译"：
+#     - 提取出最能说明问题的那一句（通常是最后一个中括号内容）；
+#     - 超过一定长度就截断；
+#     - 保证"看得懂、能据此找维护人员"，但看不到完整 SQL 与表结构细节。
+#
+# 【注意】这不会影响排错能力：
+#   完整原始异常仍然被 logger.error / sql_audit.log 完整记录在文件里。
+_MAX_ERROR_LEN = 160
+
+
+def _brief_error(exc: Exception) -> str:
+    """把数据库原始异常压成一句"用户能看懂、又不泄内部细节"的说明。
+
+    【新手难点：为什么保留而不是全部隐藏？】
+        如果什么都不说，用户只会看到"失败了"，无从判断是网络断了、
+        密码错了，还是某个科目没数据 —— 反而给维护增加成本。
+        所以保留"错误类型层面的信息"，隐去"SQL 与表结构层面的信息"。
+    """
+    # 第1步：把换行、Tab、连续空格统统压成单个空格，并去掉外层引号
+    text = " ".join(str(exc).split()).strip().strip("\"'")
+    if not text:
+        return "数据库操作失败（详细信息见日志）"
+
+    # 第1步补充：pyodbc 常把错误包成元组形式 ('42000', "真正的说明")。
+    #   这种外壳（错误码 + 引号）对用户没意义，所以取最长的那个双引号片段。
+    #   没有双引号（如纯文本错误）就原样保留。
+    quoted = re.findall(r'"([^"]*)"', text)
+    if quoted:
+        text = max(quoted, key=len).strip()
+
+    # 第2步：SQL Server 的报错形如
+    #   ('42000', "[42000] [Microsoft][ODBC Driver 17 for SQL Server]
+    #    [SQL Server]对象名 'GL_accvch' 无效。 (208) (SQLExecDirectW)")
+    #   前面那几段 [方括号] 只是"哪个驱动、哪个组件报的"，对用户毫无意义，
+    #   真正有用的是中文那句话。所以把所有 [方括号] 整段删掉。
+    cleaned = re.sub(r"\[[^\]]*\]", " ", text)
+
+    # 第3步：再删掉"纯英文/数字的括注"，如 (208)、(SQLExecDirectW)。
+    #   [A-Za-z0-9_ ] 只匹配 ASCII，所以 (无效) 这种中文括注会被保留。
+    cleaned = re.sub(r"\([A-Za-z0-9_ ]*\)", " ", cleaned)
+    cleaned = " ".join(cleaned.split()).strip(" \"',")
+
+    # 第4步：万一清洗后什么都不剩（极少见），退回原始文本，总比空着强
+    if not cleaned:
+        cleaned = text
+
+    # 第5步：太长就截断，保证弹窗/日志不被一行字撑爆
+    if len(cleaned) > _MAX_ERROR_LEN:
+        cleaned = cleaned[:_MAX_ERROR_LEN] + "…"
+    return cleaned
 
 
 class DatabaseError(Exception):
@@ -281,7 +341,7 @@ class Database:
     # 查询接口
     # ------------------------------------------------------------------
     def query(self, sql: str, params: Optional[Sequence[Any]] = None,
-              database: Optional[str] = None) -> list[tuple]:
+              database: Optional[str] = None, tag: str = "") -> list[tuple]:
         """
         执行查询，返回全部行（list[tuple]，每个元组是一行）。
 
@@ -289,6 +349,8 @@ class Database:
             sql      : SQL 语句，用 ? 作为参数占位符
             params   : 与 ? 一一对应的参数值（可防止 SQL 注入）
             database : 可选。若指定，先 USE 切到该库再执行查询
+            tag      : 可选。标记"这条查询是哪张报表发起的"（如 "LK01"），
+                       只写进 sql_audit.log，不显示在界面上
 
         【新手必学：为什么要用参数占位符 ?】
             ❌ 错误写法（危险）：
@@ -312,18 +374,19 @@ class Database:
             cur.execute(sql, params or [])
             rows = cur.fetchall()                 # 取出所有结果行
             elapsed = time.perf_counter() - start # 计算耗时
-            SQLAudit.record(sql, params, elapsed, len(rows))   # 写审计日志
+            # 写审计日志（tag 让维护人员知道是哪个报表取的数）
+            SQLAudit.record(sql, params, elapsed, len(rows), tag=tag)
             # 把 pyodbc 的 Row 对象统一转成普通元组，方便后续处理
             return [tuple(r) for r in rows]
         except Exception as exc:
             elapsed = time.perf_counter() - start
-            # 出错了也要记审计日志，标注错误内容
-            SQLAudit.record(sql, params, elapsed, 0, error=str(exc))
+            # 出错了也要记审计日志，标注错误内容（完整信息只落文件）
+            SQLAudit.record(sql, params, elapsed, 0, error=str(exc), tag=tag)
             logger.error("查询失败: %s | SQL=%s", exc, sql)
-            raise DatabaseError(f"查询失败：{exc}") from exc
+            raise DatabaseError(f"查询失败：{_brief_error(exc)}") from exc
 
     def query_dict(self, sql: str, params: Optional[Sequence[Any]] = None,
-                   database: Optional[str] = None) -> list[dict]:
+                   database: Optional[str] = None, tag: str = "") -> list[dict]:
         """
         执行查询，返回字典列表（每个字典的键是列名，值是单元格）。
 
@@ -349,12 +412,12 @@ class Database:
             cols = [d[0] for d in cur.description]
             rows = cur.fetchall()
             elapsed = time.perf_counter() - start
-            SQLAudit.record(sql, params, elapsed, len(rows))
+            SQLAudit.record(sql, params, elapsed, len(rows), tag=tag)
             return [dict(zip(cols, r)) for r in rows]
         except Exception as exc:
             elapsed = time.perf_counter() - start
-            SQLAudit.record(sql, params, elapsed, 0, error=str(exc))
-            raise DatabaseError(f"查询失败：{exc}") from exc
+            SQLAudit.record(sql, params, elapsed, 0, error=str(exc), tag=tag)
+            raise DatabaseError(f"查询失败：{_brief_error(exc)}") from exc
 
     def query_one(self, sql: str, params: Optional[Sequence[Any]] = None):
         """返回单行（没有结果则返回 None）。常用于"只查一条记录"的场景。"""
@@ -377,7 +440,8 @@ class Database:
             return default
         return row[0]
 
-    def execute(self, sql: str, params: Optional[Sequence[Any]] = None) -> int:
+    def execute(self, sql: str, params: Optional[Sequence[Any]] = None,
+                tag: str = "") -> int:
         """
         执行非查询语句（INSERT/UPDATE/DELETE/建表等），返回受影响行数。
 
@@ -391,12 +455,12 @@ class Database:
             cur.execute(sql, params or [])
             n = cur.rowcount    # 受影响行数
             elapsed = time.perf_counter() - start
-            SQLAudit.record(sql, params, elapsed, n)
+            SQLAudit.record(sql, params, elapsed, n, tag=tag)
             return n
         except Exception as exc:
             elapsed = time.perf_counter() - start
-            SQLAudit.record(sql, params, elapsed, 0, error=str(exc))
-            raise DatabaseError(f"执行失败：{exc}") from exc
+            SQLAudit.record(sql, params, elapsed, 0, error=str(exc), tag=tag)
+            raise DatabaseError(f"执行失败：{_brief_error(exc)}") from exc
 
     # ------------------------------------------------------------------
     # 元数据辅助（"元数据"= 描述数据的数据，比如有哪些表、表里有哪些列）

@@ -219,7 +219,10 @@ class ReportContext:
 
         start = time.perf_counter()
         # database 为空字符串时传 None，因为 Database.query 约定用 None 表示"不切换库"
-        rows = self.db.query(sql, params, database=database or None)
+        # 【关键】tag=report_code：把"哪张报表发的查询"带给审计日志，
+        #   这样 sql_audit.log 里每行都能看出归属，出问题时可按报表代码直接筛。
+        #   注意它只进日志文件，不会出现在界面【运行日志】里。
+        rows = self.db.query(sql, params, database=database or None, tag=report_code)
         elapsed = time.perf_counter() - start
 
         self._cache[key] = rows
@@ -245,7 +248,8 @@ class ReportContext:
             return self._cache[key]
 
         start = time.perf_counter()
-        rows = self.db.query_dict(sql, params, database=database or None)
+        rows = self.db.query_dict(sql, params, database=database or None,
+                                  tag=report_code)
         elapsed = time.perf_counter() - start
 
         self._cache[key] = rows

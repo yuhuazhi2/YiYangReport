@@ -130,7 +130,7 @@ class SQLAudit:
 
     @classmethod
     def record(cls, sql: str, params=None, elapsed: float = 0.0,
-               rowcount: int = 0, error: str = "") -> None:
+               rowcount: int = 0, error: str = "", tag: str = "") -> None:
         """
         记录一次数据库操作。
 
@@ -140,6 +140,17 @@ class SQLAudit:
             elapsed  : 耗时（秒）
             rowcount : 影响/返回的行数
             error    : 若有错误，记录错误信息
+            tag      : 可选标记，写明"这条 SQL 是哪张报表发起的"（如 "LK01"）。
+
+        【新手必学：为什么要加 tag？】
+            一张报表生成失败时，维护人员打开 sql_audit.log 会看到几十上百条 SQL。
+            如果每行都带 [LK01] 这样的标记，就能一眼筛出"出问题那张表取过哪些数"，
+            不用凭时间顺序去猜。这是"可追溯性"（traceability）的典型做法。
+
+        【重要：本日志只写文件，绝不进界面】
+            类属性 _logger 设置了 propagate=False，保证这些内容不会冒泡到
+            根日志器（也就不会出现在控制台或 app.log）。
+            因此"SQL 语句"这一类技术细节，天然被隔离在审计文件里。
         """
         lg = cls._get_logger()
 
@@ -149,11 +160,14 @@ class SQLAudit:
         # 三目写法：有错误就标 ERR(错误内容)，否则标 OK
         status = "OK" if not error else f"ERR({error})"
 
+        # 有 tag 就显示成 "[LK01] "，没有就留空，保证格式统一不乱
+        tag_part = f"[{tag}] " if tag else ""
+
         # 用 "{}" 占位符格式化，比直接用 f-string 更专业：
         # 这样日志库能延迟处理字符串拼接，且更容易按需过滤。
         lg.info(
-            "[%s] rows=%d elapsed=%.3fs params=%s sql=%s",
-            status, rowcount, elapsed, params, sql_one,
+            "[%s] %srows=%d elapsed=%.3fs params=%s sql=%s",
+            status, tag_part, rowcount, elapsed, params, sql_one,
         )
 
 
