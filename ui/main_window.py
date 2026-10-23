@@ -28,6 +28,10 @@ from pathlib import Path
 # 【新手须知】QThread 是"线程"，Signal 是"信号"。
 # 两者都在 QtCore 里，不是 QtWidgets（Widgets 专管可见控件）。
 from PySide6.QtCore import QThread, Signal
+# 【新手必学】快捷键相关的两个类都在 QtGui 里，不在 QtWidgets：
+#   QKeySequence → 把 "Ctrl+Shift+D" 这类文本解析成"按键组合"对象
+#   QShortcut    → 把一个按键组合"绑定"到某个窗口函数上
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QFileDialog,      # 文件/目录选择对话框
     QFormLayout,      # "标签: 控件" 两列式布局，做表单最好用
@@ -151,14 +155,17 @@ class MainWindow(QMainWindow):
         self._worker = None         # 当前的后台线程（None 表示没有任务在跑）
 
         self.setWindowTitle("U8报表生成器")
-        self.resize(860, 660)       # 初始窗口大小（宽 860 × 高 660）
+        # 【新手须知】窗口高度比上一版（660）矮了不少。
+        #   原因是【运行日志】默认收起，不再占垂直空间（详见 _build_ui）。
+        #   客户看到的界面就是"账套与期间 / 输出 / 生成"三块，干净紧凑。
+        #   维护者按 Ctrl+Shift+D 展开日志时，_toggle_dev_panel 会自动把窗口加高。
+        self.resize(860, 470)
 
         # 【新手必学】初始化顺序很重要，一般是：
         #   先建界面 → 再加载数据 → 最后刷新显示
         # 如果顺序反了，界面控件可能还不存在，赋值的代码就会报错。
         self._build_ui()
         self._load_catalog()
-        self._refresh_connection_label()
         self._check_env()
 
     # ------------------------------------------------------------------
@@ -181,21 +188,22 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
 
-        # ---- 连接与账套信息 ----
+        # ---- 账套与期间信息 ----
         # QGroupBox 用来给界面"分区"，视觉上更像一块一块的功能区
-        gb_conn = QGroupBox("连接与账套")
+        #
+        # 【新手难点】这里**故意不显示**"数据库连接串"和"模板路径"这两行。
+        #   为什么不显示？它们属于"技术细节"：
+        #     - 连接串又长又密（服务器\实例 / 库名 / 认证方式），普通用户看着发懵；
+        #     - 模板路径往往长到半屏，还会把窗口顶得很宽。
+        #   但信息并没有丢：
+        #     - 连接信息随时可点"重新设置连接…"对话框查看和修改；
+        #     - 模板是否解析成功，看下方【运行日志】里的提示即可。
+        gb_conn = QGroupBox("账套与期间")
         form = QFormLayout(gb_conn)
 
         # 【新手必学】"self.xxx = 控件" 是固定套路。
         # 加 self. 是为了让别的函数也能访问到它（如 _on_click 里读它的值）。
         # 如果不加 self. 写成局部变量，函数一结束就被回收了，别的函数根本找不到。
-        self.lbl_conn = QLabel()
-        self.lbl_conn.setWordWrap(True)   # 文字太长时自动换行，不至于把窗口撑破
-        form.addRow("数据库：", self.lbl_conn)
-
-        self.lbl_template = QLabel()
-        self.lbl_template.setWordWrap(True)
-        form.addRow("模板：", self.lbl_template)
 
         # 会计期间：年份 + 月份两个数字框，放在一个水平布局里
         row_period = QHBoxLayout()
@@ -271,12 +279,21 @@ class MainWindow(QMainWindow):
         v.addWidget(self.lbl_progress)
         root.addWidget(gb_gen)
 
-        # ---- 结果日志 ----
-        gb_log = QGroupBox("运行日志")
-        vlog = QVBoxLayout(gb_log)
-        self.txt_log = QPlainTextEdit()
-        self.txt_log.setReadOnly(True)   # 日志只读，防止用户乱改
-        vlog.addWidget(self.txt_log)
+        # ---- 结果区（客户可见）----
+        # 【设计思路：把"客户要用的"和"维护要看的"彻底分开】
+        #   客户真正关心的只有两件事：
+        #     1. 这次到底成了没有、成了几张（→ lbl_result 一句话说清）
+        #     2. 结果文件在哪、怎么打开（→ 下面两个按钮）
+        #   至于逐张表的滚动日志、SQL 原文、审计文件路径，
+        #   那是我（维护者）排错时才需要的，全部收进下面的"维护面板"。
+        #   这样客户界面干净，也不会顺手点开一堆看不懂的英文字。
+        gb_result = QGroupBox("结果")
+        vres = QVBoxLayout(gb_result)
+        self.lbl_result = QLabel("就绪")
+        # 【新手必学】setWordWrap(True) = 文字太长时自动换行，
+        # 而不是把窗口硬撑宽（否则用户一拉窗口，长句会把布局顶变形）。
+        self.lbl_result.setWordWrap(True)
+        vres.addWidget(self.lbl_result)
 
         row_tools = QHBoxLayout()
         self.btn_open_dir = QPushButton("打开输出目录")
@@ -289,14 +306,46 @@ class MainWindow(QMainWindow):
         # 等生成成功后再 setEnabled(True) 点亮它（见 _on_finished）。
         self.btn_open_file.setEnabled(False)
         row_tools.addWidget(self.btn_open_file)
+        row_tools.addStretch(1)
+        vres.addLayout(row_tools)
+        root.addWidget(gb_result)
+
+        # ---- 运行日志（维护面板：默认整块收起）----
+        # 【新手难点】为什么整块隐藏，而不是只藏某个按钮？
+        #   客户不需要看日志，而日志里天然含有大量内部信息
+        #   （表名、SQL、驱动报错、路径……）。与其逐条去想"这句能不能给他看"，
+        #   不如从根上解决：**日志区默认不存在于客户视野**。
+        #   我按 Ctrl+Shift+D 才把它展开 —— 需要查错时才看，看完再按一次收起。
+        #
+        # 【重要：隐藏 ≠ 停止记录】
+        #   控件 setVisible(False) 之后，往里面 appendPlainText 依然有效，
+        #   只是不画在屏幕上。所以整个生成过程中的日志一行不落，
+        #   我展开面板的瞬间就能看到完整历史，不用"从头再跑一遍"。
+        self.gb_log = QGroupBox("运行日志（维护模式）")
+        vlog = QVBoxLayout(self.gb_log)
+        self.txt_log = QPlainTextEdit()
+        self.txt_log.setReadOnly(True)   # 日志只读，防止用户乱改
+        vlog.addWidget(self.txt_log)
+
+        # SQL 审计入口只属于维护面板，跟着面板一起隐藏/显示。
+        # 注意：这里**不再**单独 setVisible(False) 了 ——
+        # 门已经被面板锁上，再给门里的抽屉上锁只会增加维护麻烦
+        # （展开面板后还得手动找按钮）。这叫"只在必要层级做控制"。
+        row_dev = QHBoxLayout()
         self.btn_open_audit = QPushButton("查看 SQL 审计")
         self.btn_open_audit.clicked.connect(self._on_open_audit)
-        row_tools.addWidget(self.btn_open_audit)
-        row_tools.addStretch(1)
-        vlog.addLayout(row_tools)
-        # 【新手必学】root.addWidget(gb_log, 1) 的 1 是"垂直伸缩因子"：
+        row_dev.addWidget(self.btn_open_audit)
+        row_dev.addStretch(1)
+        vlog.addLayout(row_dev)
+
+        # 【新手必学】root.addWidget(控件, 1) 的 1 是"垂直伸缩因子"：
         # 让日志区吃掉下方所有多余空间，窗口拉大时日志框跟着变大。
-        root.addWidget(gb_log, 1)
+        root.addWidget(self.gb_log, 1)
+        # 默认收起。客户打开程序就是看不到它，界面干净紧凑。
+        self.gb_log.setVisible(False)
+
+        # 装好"维护快捷键"（详见 _install_dev_shortcut 的说明）
+        self._install_dev_shortcut()
 
         # 记录最近一次生成的文件路径，None 表示"还没生成过"
         self._result_path: Path | None = None
@@ -304,22 +353,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # 初始化辅助
     # ------------------------------------------------------------------
-    def _refresh_connection_label(self) -> None:
-        """把配置里的数据库连接信息，拼成一行文字显示到界面上。
-
-        【新手必学】"条件表达式"（也叫三元运算符）：
-            A if 条件 else B
-        意思是：条件成立就取 A，否则取 B。比写 if/else 四行代码更简洁。
-        """
-        c = self.config.connection
-        auth = "Windows 认证" if c.use_windows_auth else f"SQL 登录({c.username})"
-        # 【新手必学】这种 "字符串" + "字符串" 叫字符串拼接。
-        # f"..." 是 f-string，花括号里可以直接写变量或表达式，
-        # 例如 f"{c.port}" 会替换成端口号本身。
-        srv = c.server + (f"\\{c.instance}" if c.instance else f",{c.port}")
-        self.lbl_conn.setText(f"{srv}  /  {c.database}  /  {auth}")
-        self.lbl_template.setText(self.config.template_path)
-
     def _load_catalog(self) -> None:
         """解析模板文件，取出所有表页信息，存进 self._catalog。
 
@@ -337,10 +370,9 @@ class MainWindow(QMainWindow):
             # 这行等价于：遍历所有表页，只留下有 code（LK 编号）的，
             # 然后数一数有几个。if s.code 在 Python 里表示"非空即为真"。
             n = len([s for s in self._catalog if s.code])
-            self._log(f"模板解析成功，正式报表 {n} 张。")
-            self.lbl_template.setText(
-                f"{self.config.template_path}（{n} 张报表）"
-            )
+            # 【新手必学】Path(...).name 只取"最后一段文件名"，
+            # 例如 G:\...\模板.xls → 模板.xls。日志里不铺满整条长路径。
+            self._log(f"模板解析成功：{Path(self.config.template_path).name}，正式报表 {n} 张。")
         except Exception as exc:  # noqa: BLE001
             self._catalog = []       # 失败就清空，防止拿着脏数据往下跑
             self._log(f"[错误] 模板解析失败：{exc}")
@@ -362,6 +394,14 @@ class MainWindow(QMainWindow):
         else:
             self._log(f"[警告] {msg}")
             self._log("提示：缺少 Excel 环境时无法生成 .xls（格式依赖 win32com）。")
+            # 【新手难点】这里为什么**还要**写 lbl_result？
+            #   因为日志区默认对客户是隐藏的 —— 只写日志等于"没告诉他"。
+            #   而"没装 Excel 就生成不了文件"是客户必须立刻知道的事，
+            #   否则他会点半天"生成"却永远拿不到结果，还以为程序坏了。
+            #   原则：**客户必须知情的事写 lbl_result，排错细节写日志**。
+            self.lbl_result.setText(
+                "环境提示：本机未检测到可用的 Excel，暂时无法生成 .xls 文件。"
+            )
 
     def _log(self, text: str) -> None:
         """往日志框里追加一行文字（自己封装一下，省得每次写长长的控件名）。"""
@@ -396,7 +436,6 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self.config.connection = dlg.result_config
             self._save_current_config()
-            self._refresh_connection_label()
             self._log("连接设置已更新并保存。")
 
     def _collect_period(self) -> None:
@@ -519,15 +558,48 @@ class MainWindow(QMainWindow):
         self.progress.setMaximum(total)
         self.progress.setValue(current)
         self.lbl_progress.setText(msg)
+        # 【设计要点：客户要知道"跑到哪了"，但不需要看技术细节】
+        #   msg 形如"正在生成 LK01 资产负债表"，本身就够友好；
+        #   这里再带上 current/total，客户一眼能判断还要等多久。
+        if code:
+            self.lbl_result.setText(f"正在生成（{current}/{total}）：{msg}")
+        # 完整日志照旧往隐藏的日志框里堆，维护者展开即可看全过程。
         if code:
             self._log(msg)
 
     def _on_finished(self, result: GenerateResult) -> None:
-        """【槽函数】收到"生成成功"信号，恢复界面并展示结果。"""
+        """【槽函数】收到"生成成功"信号，恢复界面并展示结果。
+
+        【设计思路：两份报告，各给各看】
+            - 客户：lbl_result 一句话（成没成、几成几败、下一步做什么）
+            - 维护：txt_log 完整明细（每张表、耗时、取数统计、勾稽差异）
+        """
         self._restore_buttons()
         # 把进度条拉满，表示"全都完成了"
         self.progress.setValue(self.progress.maximum())
         self.lbl_progress.setText(result.message)
+
+        # ---- 客户区：一句话结论 ----
+        # 【新手必学】用 len() 数"成功了几张"，用 len(result.failed) 数"失败几张"。
+        #   这两个数字凑起来就是"客户唯一真正想知道的事"。
+        n_ok = len(result.generated_codes)
+        n_fail = len(result.failed)
+        if n_fail == 0:
+            self.lbl_result.setText(
+                f"生成完成：成功 {n_ok} 张，用时 {result.elapsed:.1f} 秒。"
+                "可点下方按钮打开结果文件。"
+            )
+        else:
+            # 【新手难点】为什么不把失败原因直接写在这里？
+            #   原因文字里难免带表名/驱动信息（属于内部细节），
+            #   而且可能有十几行，塞进一句话会把界面撑爆。
+            #   所以客户只需要知道"有几张没成、该找谁"，
+            #   具体原因由维护者展开日志面板查看。
+            self.lbl_result.setText(
+                f"生成结束：成功 {n_ok} 张，未成功 {n_fail} 张。"
+                "结果文件已生成，但部分表页数据不完整，请联系维护人员核查。"
+            )
+
         self._log("-" * 40)          # 【新手须知】字符串乘数字 = 重复拼接，这里画出 40 个横线分隔
         self._log(result.message)
 
@@ -537,6 +609,14 @@ class MainWindow(QMainWindow):
             self._log("[失败表页]")
             for code, err in result.failed.items():
                 self._log(f"  {code}: {err}")
+            # 【新手必学：给用户"下一步该做什么"，而不是只报个错】
+            #   普通财务人员看到"某某表失败"之后，最需要知道的是：
+            #     1. 这跟我有没有关系（要不要我重新操作）；
+            #     2. 真解决不了该找谁、该给谁看什么。
+            #   所以这里给一句明确指引，具体的技术细节（SQL、表名、堆栈）
+            #   已经完整写进 logs\ 目录下的文件，交给维护人员去查。
+            self._log("  提示：以上为简要原因。"
+                      "如无法自行解决，请把 logs 目录整体发给维护人员。")
         if result.audit_summary:
             self._log(f"[取数统计] {result.audit_summary}")
         # 【新手必学】:.2f 意思是"保留两位小数"，例如 12.3456 → 12.35
@@ -559,8 +639,19 @@ class MainWindow(QMainWindow):
         """【槽函数】收到"失败"信号，恢复界面并弹窗提示错误。"""
         self._restore_buttons()
         self.lbl_progress.setText("生成失败")
+        # 【设计要点：弹窗给客户看，日志给维护看】
+        #   err 是整条流程崩掉的原始信息（可能很技术），
+        #   直接弹给财务人员没有意义，还可能泄露内部结构。
+        #   所以：客户区只说"失败了、请联系维护"，原始 err 只进日志。
+        self.lbl_result.setText(
+            "生成失败：本次未能产出结果文件。请联系维护人员处理。"
+        )
         self._log(f"[错误] {err}")
-        QMessageBox.critical(self, "生成失败", err)
+        QMessageBox.critical(
+            self, "生成失败",
+            "本次未能完成生成。\n\n请联系维护人员处理，"
+            "维护人员可展开日志区查看详细原因。",
+        )
 
     def _restore_buttons(self) -> None:
         """把生成前禁用的按钮重新启用（生成结束/失败时都要调用）。
@@ -571,6 +662,70 @@ class MainWindow(QMainWindow):
         """
         self.btn_select.setEnabled(True)
         self.btn_generate_all.setEnabled(True)
+
+    # ------------------------------------------------------------------
+    # 开发者入口（默认隐藏）
+    # ------------------------------------------------------------------
+    # 【新手必学】把"快捷键"定义成类常量，好处：
+    #   1. 想换键位只改这一处；
+    #   2. 注释能写清给谁用，日后接手的人不会一脸茫然。
+    DEV_PANEL_SHORTCUT = "Ctrl+Shift+D"
+
+    # 维护面板展开后的目标窗口高度（像素）。
+    # 单独定义成常量，方便日后调整，不用在代码里翻那个魔法数字。
+    DEV_PANEL_HEIGHT = 720
+
+    def _install_dev_shortcut(self) -> None:
+        """把"展开/收起维护面板"绑定到快捷键上。
+
+        【新手难点】为什么一个快捷键能"一键切换"，而不是只"一键显示"？
+            因为槽函数里判断当前状态再取反：
+            现在藏着就显示，现在露着就收起 —— 同一个键来回切。
+            比"一个键显示、另一个键隐藏"好记，也不容易忘。
+
+        【新手难点】self._sc_panel 为什么要存成实例属性？
+            QShortcut 对象一旦没人引用，会被 Python 的垃圾回收机制回收掉，
+            快捷键随即失效（而且不报错，极难排查）。
+            存到 self 上 = 让主窗口长期"牵着"它，保证一直有效。
+        """
+        self._sc_panel = QShortcut(QKeySequence(self.DEV_PANEL_SHORTCUT), self)
+        # 【新手必学】QShortcut 的 activated 信号：按键被按下时触发。
+        self._sc_panel.activated.connect(self._toggle_dev_panel)
+
+    def _toggle_dev_panel(self) -> None:
+        """展开 / 收起【运行日志（维护模式）】整块面板。
+
+        【这个面板里有什么】
+            - 逐张表的生成日志（成功/跳过/失败原因）
+            - "查看 SQL 审计"按钮（打开 sql_audit.log，含原始 SQL）
+            - 勾稽核对报告、耗时统计等技术信息
+          这些对外是"内部细节"，对内是"排错必需品"，所以默认收起。
+        """
+        # 【新手难点】这里为什么用 isHidden()，而不是 isVisible()？
+        #   isVisible() 判断的是"**此刻真的**显示在屏幕上没有"，
+        #   它受"父窗口是否已显示"影响：如果主窗口还没 show()（例如程序
+        #   刚启动、或自动化测试里没调 show()），子控件的 isVisible()
+        #   一律返回 False —— 那我们写成 setVisible(not isVisible()) 就会
+        #   变成"每次都设成 True"，切换逻辑直接失效。
+        #   isHidden() 判断的是"控件**自身**有没有被显式隐藏"，与父窗口无关，
+        #   正是这里需要的语义。
+        #
+        #   所以：isHidden() 为 True（现在藏着）→ setVisible(True) 展开
+        #         isHidden() 为 False（现在露着）→ setVisible(False) 收起
+        showing = self.gb_log.isHidden()
+        self.gb_log.setVisible(showing)
+
+        # 【新手必学：顺手给用户一个"够用"的窗口高度】
+        #   面板收起时窗口只有几百像素高，突然展开日志区会把下面的内容
+        #   挤得几乎看不见。所以展开时若窗口偏矮，就自动加高到 DEV_PANEL_HEIGHT。
+        #   用 max(...) 保证"只加高、不压缩"：如果我本来就手动拉得比它高，
+        #   就不要把我拉的尺寸改小。
+        if showing:
+            self.resize(self.width(), max(self.height(), self.DEV_PANEL_HEIGHT))
+        # 【重要：故意不写日志】
+        #   如果在这里 _log("再按 Ctrl+Shift+D 可收起")，
+        #   就等于把"维护快捷键"直接印在日志里 —— 虽然日志本身也藏起来了，
+        #   但万一误开就会泄露。所以保持静默：知道这个键的人本来就懂。
 
     # ------------------------------------------------------------------
     # 工具按钮
