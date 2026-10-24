@@ -341,7 +341,88 @@ def salary_data(year: int, month: int, wa_class: str = "") -> tuple[str, list]:
 
 
 # ---------------------------------------------------------------------------
-# 七、元数据 / 诊断（供核对与排错）
+# 七、账套注册信息（系统库 UFSystem）—— 决定"该连哪个年度库"
+# ---------------------------------------------------------------------------
+def account_database(system_database: str, acc_id: str, year: int) -> tuple[str, list]:
+    """查询"某账套在某年度"对应的年度库名（如 UFDATA_001_2026）。
+
+    【这张表是什么？】
+        用友把"有哪些账套、每个账套有哪几年的库"登记在系统库
+        UFSystem 的 UA_AccountDatabase 表里。这是**权威来源**：
+        年度库叫什么名字，必须问它，不能靠人猜、更不能靠客户手填。
+
+    【关键字段】
+        cAcc_Id     账套号（如 "001"），对应界面上的"账套号"
+        cDatabase   年度库名（如 "UFDATA_001_2026"）—— 我们要的就是它
+        iBeginYear  该年度库覆盖的开始年度
+        iEndYear    该年度库覆盖的结束年度；**可能是 NULL**
+
+    【匹配规则（现场确定的业务口径，不要随意改动）】
+        条件一：cAcc_Id 等于操作人选的账套号
+        条件二：满足下面任意一条
+            a) 选的年度在 iBeginYear 与 iEndYear 之间（含两端）
+            b) iEndYear 为 NULL，且选的年度正好等于 iBeginYear
+
+    【新手难点：为什么 (b) 里只用 = 而不是 >=？】
+        按现场给的口径：iEndYear 为 NULL 时，这条记录**只代表开始那一年**，
+        而不是"从开始年度一直有效"。这是用友数据本身的约定，
+        我们必须照着它判断，否则可能把 2026 年的账错当成 2030 年的。
+
+    【新手必学：为什么库名要拼进 SQL，而不是用 ? 占位符？】
+        因为 [UFSystem] 是"库名/表名"，属于标识符；
+        占位符 ? 只能放"值"（如账套号、年度），不能放标识符。
+        所以库名用 quote_ident 安全包裹后拼接，而**账套号与年度仍走 ?**，
+        这样既满足语法要求，又杜绝了注入风险。
+
+    【新手必学：(a) 与 (b) 用 OR 连接，外面套一层括号】
+        WHERE cAcc_Id = ?
+          AND ( (年度区间判断) OR (NULL 特例判断) )
+        如果不加外层括号，SQL 的 AND 优先级高于 OR，
+        就会变成 "A AND B OR C"，与我们的本意完全不同 —— 这是极常见的错误。
+    """
+    # 延迟导入：避免 queries 与 core 之间产生循环导入
+    from core.db import quote_ident
+
+    sysdb = quote_ident(system_database)
+    # 【新手须知：为什么把 iBeginYear / iEndYear 也一起查出来？】
+    #   它们不影响"取哪个库"的判断（那是 WHERE 的事），
+    #   但带回上层后，可以写进日志："账套 001 的 2026 年 → UFDATA_001_2026
+    #   （覆盖 2026~2026）"。日后核对"为什么查的是这个库"时，
+    #   这行日志就是最直接的证据。
+    sql = f"""
+        SELECT cDatabase, iBeginYear, iEndYear
+        FROM {sysdb}.dbo.UA_AccountDatabase
+        WHERE cAcc_Id = ?
+          AND (
+                (iEndYear IS NOT NULL AND ? BETWEEN iBeginYear AND iEndYear)
+             OR (iEndYear IS NULL AND ? = iBeginYear)
+          )
+        ORDER BY iBeginYear DESC
+    """
+    # 三个 ? 依次是：账套号、年度（区间判断）、年度（NULL 特例判断）
+    return sql, [acc_id, year, year]
+
+
+def list_accounts(system_database: str) -> tuple[str, list]:
+    """列出所有账套（供界面辅助提示、以及维护时排查"账套号填错了"）。
+
+    【用途】客户说"账套号是 001"但查不到库时，用它把所有账套号列出来，
+        一看就知道是不是输成了 "1"、或者实际叫 "001"。
+    【注意】只是"读"，不涉及任何写入。
+    """
+    from core.db import quote_ident
+
+    sysdb = quote_ident(system_database)
+    sql = f"""
+        SELECT DISTINCT cAcc_Id, cDatabase, iBeginYear, iEndYear
+        FROM {sysdb}.dbo.UA_AccountDatabase
+        ORDER BY cAcc_Id, iBeginYear
+    """
+    return sql, []
+
+
+# ---------------------------------------------------------------------------
+# 八、元数据 / 诊断（供核对与排错）
 # ---------------------------------------------------------------------------
 def check_table_exists(table_name: str) -> tuple[str, list]:
     """检查表是否存在（用于取数前校验）
