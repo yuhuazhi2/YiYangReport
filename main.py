@@ -127,9 +127,19 @@ def main() -> int:
     if not excel_ok:
         # QMessageBox.warning 会弹出一个"警告"对话框
         # 第一个参数 None 表示"没有父窗口"（此处主窗口还没创建）
+        #
+        # 【新手须知：为什么这里不直接把 excel_msg 拼进去？】
+        #   excel_msg 已经是"面向客户的一句话结论"，不再包含 COM 报错原文。
+        #   原始报错（含 CLSID、类型库编号等术语）只写进 logs/app.log，
+        #   由维护人员排查；客户看到的是"怎么回事 + 该怎么办"。
         QMessageBox.warning(
             None, "环境提示",
-            f"{excel_msg}\n\n生成 .xls 报表需要本机安装 Microsoft Excel 与 pywin32。",
+            f"{excel_msg}\n\n"
+            "生成 .xls 报表需要本机安装 Microsoft Excel（建议 2010 及以上）。\n"
+            "本机原有的 Excel 文件仍可通过 Excel 正常打开，说明问题一般出在"
+            "程序组件而非 Office 本身。\n\n"
+            "请先关闭本窗口，稍后重新启动程序再试一次；"
+            "若反复出现此提示，请联系维护人员协助检查。",
         )
 
     # ------------------------------------------------------------------

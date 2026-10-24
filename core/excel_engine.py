@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -42,17 +43,170 @@ logger = get_logger(__name__)
 #   把它包起来并设置 HAS_WIN32 标志位，让程序能在"没有装 pywin32"的
 #   机器上正常导入本模块，只是真正要生成报表时才提示错误。
 try:
-    import win32com.client as win32   # 用 as 起个别名，写起来短一些
-    import pythoncom                  # COM 初始化的辅助库
+    import win32com.client as win32          # 用 as 起个别名，写起来短一些
+    import win32com.client.gencache as gencache  # 类型库缓存（早期绑定用）
+    import pythoncom                         # COM 初始化的辅助库
     HAS_WIN32 = True
 except ImportError:
     win32 = None
+    gencache = None
     pythoncom = None
     HAS_WIN32 = False
 
 
 class ExcelEngineError(Exception):
     """Excel 引擎专用异常（自定义异常，便于上层精确捕获）。"""
+
+
+# 【新手须知：为什么需要一个"修缓存"的函数？】
+#   pywin32 的"早期绑定"会先在硬盘上生成一小段 Python 源码（缓存），
+#   之后每次调用 Excel 都直接用它，速度更快。
+#   缓存位置在 %TEMP%\gen_py\3.11\<Excel的类型库编号>\ 下。
+#
+#   但这个目录可能被"悄悄破坏"：
+#     - 杀毒软件/电脑清理工具删掉了里面的 .py 文件；
+#     - 异常关机或断电，只写了一半；
+#     - 同一台机器装过多套 Python 或重装过 pywin32，互相覆盖。
+#   一旦 .py 丢失、只剩 __pycache__ 里的 .pyc，Python 3 会把该目录
+#   当成"空的命名空间包"——import 不报错，但里面什么都没有，
+#   于是抛出 module has no attribute 'CLSIDToClassMap'。
+#   这句报错极具误导性：用户会以为"电脑没装 Excel"，其实 Excel 好好的。
+#
+#   所以下面这个函数只做一件事：把"只有 .pyc、没有 .py"的坏目录找出来删掉，
+#   让 pywin32 下次自动重新生成一份干净的。
+#   判定依据非常保守——正常缓存目录里一定有 __init__.py，
+#   只有它缺失时才认定损坏，绝不误删别的程序（Word、ADO 等）的缓存。
+def _repair_gencache() -> int:
+    """
+    清理 pywin32 类型库缓存中"源文件丢失"的坏目录，并同步清掉内存里的残留。
+
+    返回：实际删除的目录数量（0 表示没有发现损坏，或没有权限删）。
+
+    【新手必学：为什么"只删文件夹"不够？】
+        pywin32 判断"缓存有没有生成过"，靠两处记录：
+          1. 硬盘上的 dicts.dat —— "我曾为这些类型库生成过文件"；
+          2. 内存里的 sys.modules —— "这些模块我已经导入过了"。
+        如果只删文件夹、不动这两处，pywin32 会认为"缓存还在"，
+        于是既不去重新生成文件，又继续把那个空模块当成真的，
+        结果就是"每次启动都失败，怎么删都删不好"。
+
+        所以这里必须三件事一起做：
+          删目录 → 清 sys.modules → 让 pywin32 重新扫描磁盘(Rebuild)。
+        这三步做完，pywin32 才会真正重新生成一份完整的缓存。
+
+    【新手必学：为什么只看第一层目录？】
+        gen_py 目录下的结构是「一层程序文件夹 + 里面的模块文件」，
+        我们只关心第一层的那些"类型库编号"文件夹，不需要钻得更深。
+        所以用 os.listdir 就够了，比 os.walk 更直接。
+    """
+    if gencache is None:
+        return 0
+
+    try:
+        root = gencache.GetGeneratePath()
+    except Exception:      # 极少数环境拿不到路径，直接放弃修复
+        return 0
+
+    if not root or not Path(root).is_dir():
+        return 0
+
+    removed_names: list[str] = []
+    for name in os.listdir(root):
+        folder = Path(root) / name
+        # 跳过文件（如 dicts.dat）和 __pycache__ 本身
+        if not folder.is_dir() or name == "__pycache__":
+            continue
+        # 【关键判定】正常缓存一定有 __init__.py；
+        #   只剩 __pycache__ 说明源文件已被删，属于坏缓存。
+        if (folder / "__init__.py").is_file():
+            continue
+        try:
+            shutil.rmtree(folder)
+            removed_names.append(name)
+            logger.warning("已清理损坏的 Excel 类型库缓存：%s", name)
+        except Exception as exc:      # 文件被占用时可能删不掉，不能因此中断
+            logger.warning("清理缓存目录失败（可忽略）：%s -> %s", name, exc)
+
+    if not removed_names:
+        return 0
+
+    # 【第2件事】清掉内存里已导入的残留模块。
+    #   否则下次 __import__ 会直接把那个"空壳"再拿出来，缓存永远修不好。
+    prefix = "win32com.gen_py."
+    for mod_name in list(sys.modules.keys()):
+        if not mod_name.startswith(prefix):
+            continue
+        tail = mod_name[len(prefix):]
+        if any(tail == n or tail.startswith(n + ".") for n in removed_names):
+            del sys.modules[mod_name]
+
+    # 【第3件事】让 pywin32 重新扫描磁盘、重写登记表。
+    #   不加这一步，dicts.dat 里仍留着"已生成"的旧记录，
+    #   EnsureDispatch 会以为缓存健在，从而拒绝重新生成。
+    try:
+        gencache.Rebuild(verbose=0)
+        logger.info("已重建 pywin32 类型库登记表。")
+    except Exception as exc:
+        # 重建失败也不致命：后面还有后期绑定兜底
+        logger.warning("重建类型库登记表失败（可忽略）：%s", exc)
+
+    return len(removed_names)
+
+
+def _dispatch_excel():
+    """
+    连接 Excel 程序，并自带"缓存坏了就修、修不好就换条路走"的能力。
+
+    【三步策略，逐级兜底】
+        第1步：正常走早期绑定（EnsureDispatch）——最快，能用就用。
+        第2步：若报错，先修一次缓存（删掉坏目录），再试早期绑定。
+        第3步：若仍失败，退回后期绑定（Dispatch）——它不读缓存，慢一点但一定能连。
+
+    【为什么要分这么细，而不是一上来就用 Dispatch？】
+        早期绑定速度快、还能享受代码提示，正常机器上应该优先用它；
+        只有在"缓存确实坏了"这种少数情况下才需要降级。
+        这样既保证速度，又保证"绝不会因为一个临时缓存问题就告诉用户没装 Excel"。
+
+    【新手难点：EnsureDispatch 与 Dispatch 的区别】
+        EnsureDispatch("Excel.Application")
+            → 先确保硬盘上有一份类型信息（缓存），再按这份信息调用。
+              好比先拿到"菜单目录"再点菜，点得快，但菜单坏了就点不了。
+        Dispatch("Excel.Application")
+            → 不查菜单，每次现问 Excel"你会不会这个操作"。
+              慢一点，但菜单坏不坏都不影响。
+        两者拿到的都是同一个 Excel 程序，后面的操作代码完全通用。
+    """
+    if not HAS_WIN32:
+        raise ExcelEngineError("未安装 pywin32，无法使用 Excel 引擎。请执行: pip install pywin32")
+
+    # 第1步：正常路径
+    try:
+        return win32.gencache.EnsureDispatch("Excel.Application")
+    except Exception as exc:
+        # 原始异常只进日志，不抛给界面（界面看到的是人话）
+        logger.warning("Excel 早期绑定失败，准备修复类型库缓存：%s", exc)
+
+    # 第2步：修缓存后重试
+    #   注意：即使 _repair_gencache() 返回 0（没找到坏目录，可能已被外部删掉），
+    #   也照样重试一次早期绑定 —— 因为此前的失败可能正是因为
+    #   目录已被删、但登记表还留着旧记录，Rebuild 之后就能正常生成了。
+    removed = _repair_gencache()
+    try:
+        app = win32.gencache.EnsureDispatch("Excel.Application")
+        if removed:
+            logger.info("类型库缓存已修复并重新生成，Excel 连接成功。")
+        return app
+    except Exception as exc:
+        logger.warning("修复缓存后早期绑定仍失败，改用后期绑定：%s", exc)
+
+    # 第3步：后期绑定兜底（不依赖任何缓存文件）
+    try:
+        app = win32.Dispatch("Excel.Application")
+        logger.info("已改用后期绑定方式连接 Excel。")
+        return app
+    except Exception as exc:
+        logger.error("连接 Excel 失败：%s", exc)
+        raise ExcelEngineError("无法启动本机的 Microsoft Excel") from exc
 
 
 class ExcelEngine:
@@ -149,11 +303,13 @@ class ExcelEngine:
 
         pythoncom.CoInitialize()   # 初始化 COM（与 close 里的 CoUninitialize 配对）
 
-        # 【新手必学：EnsureDispatch vs Dispatch】
-        #   Dispatch("Excel.Application") → 每次调用都动态查接口，慢
-        #   gencache.EnsureDispatch(...)  → 首次生成缓存，之后调用快很多
-        #   代价是首次运行会稍慢，之后明显提速。
-        self._excel = win32.gencache.EnsureDispatch("Excel.Application")
+        # 【新手必学：为什么这里不直接写 EnsureDispatch？】
+        #   连接 Excel 这一步"埋着雷"：pywin32 的类型库缓存可能被破坏，
+        #   破坏后报的错是 "module has no attribute 'CLSIDToClassMap'"，
+        #   极具误导性（看着像没装 Excel，其实 Excel 好好的）。
+        #   所以统一走 _dispatch_excel()：它内部会自动修缓存、修不好就降级，
+        #   保证"只要这台机器真的有 Excel，就一定能连上"。
+        self._excel = _dispatch_excel()
 
         self._excel.Visible = False        # 不显示 Excel 窗口（后台跑）
         self._excel.DisplayAlerts = False  # 关闭"确定要删除吗"之类的弹窗，否则会卡住
@@ -484,13 +640,29 @@ def check_excel_available() -> tuple[bool, str]:
         连上拿到版本号后立刻 Quit，开销很小。
     """
     if not HAS_WIN32:
-        return False, "未安装 pywin32（pip install pywin32）"
+        # 面向客户的措辞：不出现 pip 之类命令行指令，交给维护人员处理
+        return False, "本机未安装 Python 的 pywin32 组件，无法生成 Excel 报表。"
+
     try:
         pythoncom.CoInitialize()
-        app = win32.gencache.EnsureDispatch("Excel.Application")
+    except Exception:
+        pass    # 已经初始化过也无妨，不影响后续
+
+    try:
+        # 【关键】走统一入口：自动修复损坏的类型库缓存，必要时降级为后期绑定。
+        # 这样"缓存坏了"不会被误判成"没有装 Excel"。
+        app = _dispatch_excel()
         ver = app.Version       # 顺便把 Excel 版本带回去，便于排查
         app.Quit()
-        pythoncom.CoUninitialize()
         return True, f"检测到 Microsoft Excel，版本 {ver}"
     except Exception as exc:
-        return False, f"未检测到可用的 Microsoft Excel：{exc}"
+        # 【重要】原始 COM 报错只进日志，不拼进界面文案。
+        #   因为那些报错里满是 CLSID、类型库编号之类的术语，
+        #   客户看不懂，反而会误以为是自己电脑的问题。
+        logger.error("Excel 可用性检测失败：%s", exc, exc_info=True)
+        return False, "未能启动本机的 Microsoft Excel。"
+    finally:
+        try:
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
