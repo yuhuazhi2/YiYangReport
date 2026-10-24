@@ -568,14 +568,49 @@ class MainWindow(QMainWindow):
             self._log(msg)
 
     def _on_finished(self, result: GenerateResult) -> None:
-        """【槽函数】收到"生成成功"信号，恢复界面并展示结果。
+        """【槽函数】收到"生成完成"信号，恢复界面并展示结果。
 
         【设计思路：两份报告，各给各看】
             - 客户：lbl_result 一句话（成没成、几成几败、下一步做什么）
             - 维护：txt_log 完整明细（每张表、耗时、取数统计、勾稽差异）
         """
         self._restore_buttons()
-        # 把进度条拉满，表示"全都完成了"
+
+        # ---- 先判断：这次是不是"连文件都没产出"？----
+        # 【新手难点：为什么必须单独处理这种情况？】
+        #   有一种失败发生在"还没开始填表"之前：账套号+年度定位不到年度库。
+        #   此时 result.success=False、output_path=None、一张表也没生成。
+        #   如果沿用下面"成功 X 张 / 未成功 Y 张"的模板，就会显示成
+        #   "生成结束：成功 0 张，未成功 0 张。结果文件已生成…"——
+        #   前半句让人一头雾水，后半句更是**假的**（根本没有文件）。
+        #   所以必须先分支：没有产出文件，就把"为什么没有"直接说给客户听。
+        if (not result.output_path) and (not result.generated_codes):
+            # 进度条**故意不拉满**：拉满会让客户以为"跑完了、成功了"。
+            # 停在 0 + 一句明确的"未生成"，比一个满格进度条诚实得多。
+            self.progress.setValue(0)
+            self.lbl_progress.setText("未生成")
+            # result.message 来自账套解析器，写的就是"人能照着做"的话
+            # （如"未找到匹配的账套库：账套号 001、年度 2025。请核对…"），
+            # 不含 SQL 原文与内部表名，可以直接给客户看。
+            self.lbl_result.setText(f"未生成报表文件。\n{result.message}")
+            self._log("-" * 40)
+            self._log(result.message)
+            self._log(f"[耗时] {result.elapsed:.2f} 秒")
+            # 【为什么要再弹一次窗？】
+            #   结果区那行字容易被忽略（客户这时往往正盯着进度条）。
+            #   "一张表都没出来"是必须立刻知道的结论，弹窗能确保他看见，
+            #   并且顺手把"下一步怎么做"讲清楚。
+            #   result.message 是账套解析器写的中文提示，不含 SQL 与表名，
+            #   可以直接展示（技术细节另有 logs 目录留档）。
+            QMessageBox.warning(
+                self, "未能生成报表",
+                f"{result.message}\n\n"
+                "本次没有产出任何文件。请按上面的提示核对后重新生成；"
+                "如仍无法解决，请联系维护人员。",
+            )
+            return
+
+        # 把进度条拉满，表示"全都跑完了"
         self.progress.setValue(self.progress.maximum())
         self.lbl_progress.setText(result.message)
 

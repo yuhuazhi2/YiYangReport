@@ -107,8 +107,15 @@ def main() -> int:
     #   找不到就返回一份"默认配置"。这样无论第一次还是第 N 次运行都不会报错。
     # ------------------------------------------------------------------
     config = load_config()
-    logger.info("配置已加载：模板=%s，数据库=%s",
-                config.template_path, config.connection.database)
+    # 【新手难点：这里为什么打印"系统库"而不是 database？】
+    #   连接对话框里用户填的那个库，现在的含义是"登录时先进哪个库"，
+    #   固定应该是用友系统库（UFSystem）—— 因为账套与年度的对应关系
+    #   就存在这个库里，不先进它，程序根本不知道"该去哪个年度库取数"。
+    #   真正的年度库（UFDATA_xxx_yyyy）是生成时按账套号+年度自动解析出来的，
+    #   写进日志容易被误读成"程序连的是这个年度库"，所以这里只记系统库。
+    logger.info("配置已加载：模板=%s，系统库=%s",
+                config.template_path,
+                config.connection.system_database or config.connection.database)
 
     # ------------------------------------------------------------------
     # 第3步：检查 Excel 环境
@@ -134,9 +141,15 @@ def main() -> int:
     #     (a) 配置里压根没有数据库信息（第一次使用）；
     #     (b) 有信息，但实际连不上（换了网络/改了口令等）。
     # ------------------------------------------------------------------
-    need_connect = not (config.connection.database and config.connection.server)
+    # 【新手难点：判断依据是"系统库"，不是"年度库"】
+    #   程序启动时只要能连上"服务器 + 系统库"，就足以完成后续全部工作：
+    #   进了系统库 → 查 UA_AccountDatabase → 得出年度库 → 切过去取数。
+    #   所以这里检查 system_database（旧配置没有这个字段时回退看 database，
+    #   因为 load_config 已经把老的年度库自动纠正成系统库了）。
+    login_db = config.connection.system_database or config.connection.database
+    need_connect = not (login_db and config.connection.server)
     # ↑ not(...and...) 的含义：
-    #   只有当"数据库名"和"服务器地址"都非空时，括号内才是 True，
+    #   只有当"系统库名"和"服务器地址"都非空时，括号内才是 True，
     #   need_connect 才会是 False（即不需要弹窗）。
 
     if not need_connect:
@@ -165,7 +178,8 @@ def main() -> int:
         config.connection = dlg.result_config
         save_config(config)
         logger.info("连接配置已保存：%s / %s",
-                    config.connection.server, config.connection.database)
+                    config.connection.server,
+                    config.connection.system_database or config.connection.database)
 
     # ------------------------------------------------------------------
     # 第5步：创建并显示主窗口，进入事件循环

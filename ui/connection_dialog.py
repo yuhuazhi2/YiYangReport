@@ -6,7 +6,17 @@
 【设计目标（对应需求）】
     1. 程序启动后首先弹出本对话框，录入 SQL Server 连接信息。
     2. 一次录入，测试连接成功后保存，下次启动自动回填（无需重复输入）。
-    3. 连接成功后可选数据库（U8 年度库，如 UFDATA_001_2026）。
+    3. 只填「系统库」（通常为 UFSystem），不需要填年度库。
+
+【为什么不再让用户填年度库？（本次最重要的思路转变）】
+    以前这里要用户自己填 UFDATA_001_2026 这样的年度库名，问题很多：
+      · 客户记不住、容易输错；
+      · 换了年度（2026 → 2027）还得回来改配置；
+      · 最危险的是：账套号填 001、实际连的却是 002 的库，程序不报错，
+        直接输出别人家的数字。
+    现在改成：用户只提供 服务器 + 账号 + 系统库 三样东西（这些是长期不变的），
+    到底查哪个年度库，由程序在生成时去问用友的账套注册表，自动确定。
+    用户少填一项，出错的机会就少一大截。
 
 本对话框只负责"获取并验证连接配置"，不负责生成报表
 （职责单一，符合分层设计原则）。
@@ -100,6 +110,8 @@ class ConnectionDialog(QDialog):
         # ---- 顶部提示文字 ----
         tip = QLabel(
             "请输入用友 U8 后台 SQL Server 的连接信息。\n"
+            "只需填写系统库（通常是 UFSystem），无需填写年度库 ——\n"
+            "具体读取哪一年的账，由程序根据您选择的账套号和年度自动定位。\n"
             "连接成功并确定后，本机将记住这些信息，下次启动自动回填。\n"
             "（数据库驱动由程序自动识别，无需您设置。）"
         )
@@ -146,24 +158,31 @@ class ConnectionDialog(QDialog):
 
         root.addWidget(gb_auth)
 
-        # ---- 数据库 ----
-        gb_db = QGroupBox("数据库")
+        # ---- 系统库 ----
+        # 【命名说明】这里刻意叫"系统库"而不是"数据库"。
+        #   用友服务器上有两种库：系统库（存账套注册信息）和年度库（存业务数据）。
+        #   本对话框要的是前者。若笼统写"数据库"，客户很容易填成年度库，
+        #   结果程序连上去找不到账套注册表，一脸茫然。
+        gb_db = QGroupBox("系统库")
         form_db = QFormLayout(gb_db)
 
         # 数据库那一行需要"下拉框 + 按钮"横向并排，所以套一个水平布局
         row_db = QHBoxLayout()
         self.cmb_db = QComboBox()
         self.cmb_db.setEditable(True)      # 允许手输（列表中没有的也能填）
-        self.cmb_db.setToolTip("如 UFDATA_001_2026")
+        self.cmb_db.setToolTip(
+            "用友的账套注册库，通常为 UFSystem。\n"
+            "不是年度库（UFDATA_xxx_yyyy），年度库由程序自动定位。"
+        )
         # addWidget(控件, 1) 里的 1 是"伸缩因子"（stretch），
         # 表示这个控件占据多余空间的 1 份，从而"撑开"占满宽度。
         row_db.addWidget(self.cmb_db, 1)
 
         self.btn_load_db = QPushButton("载入库列表")
-        self.btn_load_db.setToolTip("连接服务器后列出可用数据库")
+        self.btn_load_db.setToolTip("连接服务器后列出可用数据库，便于确认系统库名")
         self.btn_load_db.clicked.connect(self._on_load_databases)
         row_db.addWidget(self.btn_load_db)
-        form_db.addRow("数据库：", row_db)
+        form_db.addRow("系统库名：", row_db)
 
         # 【注意】此处不再放置"ODBC 驱动"下拉框：
         #   驱动由程序自动依次尝试，用户无需（也无法）选择。
@@ -209,7 +228,9 @@ class ConnectionDialog(QDialog):
         self.chk_win.setChecked(c.use_windows_auth)
         self.ed_user.setText(c.username)
         self.ed_pwd.setText(c.password)
-        self.cmb_db.setCurrentText(c.database)
+        # 优先回填系统库名；若老配置里存的是年度库，先原样显示出来 ——
+        # 让用户看见"哦，这里以前填的是年度库"，再自行改成 UFSystem。
+        self.cmb_db.setCurrentText(c.system_database or c.database)
         # 驱动不再从界面回填（界面已无此项），完全交给程序自动识别。
         self._on_auth_changed()   # 手动触发一次，让账号密码框的启用状态正确
 
@@ -244,7 +265,15 @@ class ConnectionDialog(QDialog):
         c.username = self.ed_user.text().strip()
         # 【注意】密码不 strip()，因为空格可能是密码的真实一部分
         c.password = self.ed_pwd.text()
-        c.database = self.cmb_db.currentText().strip()
+
+        # 【关键】界面上填的是"系统库"，必须写进 system_database 字段。
+        #   如果错写进 database，登录串就会去连"系统库"以外的库，
+        #   而 database 这个字段的语义是"运行时解析出的年度库"，两者不能混。
+        entered = self.cmb_db.currentText().strip()
+        c.system_database = entered or "UFSystem"
+        c.database = c.system_database
+        # target_database 留空：它要等生成时按账套号+年度解析出来才有值。
+        c.target_database = ""
         # 【关键】驱动一律留空，表示"自动"：
         #   Database.connect() 会自动挑一个可用的 SQL Server 驱动，
         #   连通后把真实驱动名回填到配置并保存，下次即可直接复用。
@@ -304,8 +333,14 @@ class ConnectionDialog(QDialog):
         """
         "载入库列表"按钮：连接服务器后列出所有数据库，供用户选择。
 
-        【需求对应】用户拿到一台陌生的 U8 服务器时，未必记得年度库名。
-                   点这个按钮就能列出全部库，并自动优先选中 UFDATA 开头的。
+        【需求对应】用户拿到一台陌生的 U8 服务器时，未必记得系统库叫什么名字
+                   （有的客户不叫 UFSystem）。点一下就能列出全部库，自动选中 UFSystem。
+
+        【重要变化：不再优先选 UFDATA 年度库】
+            以前这一步会去挑 UFDATA_xxx 开头的库并选中它，因为那时界面要填的是
+            "年度库"。现在界面要填的是"系统库"，如果还去挑 UFDATA，
+            等于把用户往错的方向引 —— 他会以为程序要的是年度库。
+            所以改为：优先选中名字里含 UFSYSTEM 的；找不到就保留原输入。
         """
         cfg = self.collect_config()
         self.btn_load_db.setEnabled(False)
@@ -323,19 +358,25 @@ class ConnectionDialog(QDialog):
             self.cmb_db.clear()
             self.cmb_db.addItems(names)
 
-            # 优先定位 U8 年度库（用友的库名通常以 UFDATA 开头）
+            # 优先定位"系统库"（用友默认叫 UFSystem，但也可能被改过名字）
             # 【新手必学：列表推导式 + 字符串方法】
-            #   [n for n in names if n.upper().startswith("UFDATA")]
-            #   筛出所有以 UFDATA 开头的库名（先转大写再判断，避免大小写问题）。
-            u8 = [n for n in names if n.upper().startswith("UFDATA")]
-            if u8:
-                # 取最后一个（通常是年度最靠后的库，如 UFDATA_001_2026）
-                self.cmb_db.setCurrentText(u8[-1])
+            #   [n for n in names if "UFSYSTEM" in n.upper()]
+            #   先转大写再判断，避免大小写差异（ufsystem / UFSystem）。
+            sys_db = [n for n in names if "UFSYSTEM" in n.upper()]
+            if sys_db:
+                self.cmb_db.setCurrentText(sys_db[0])
             elif current:
                 self.cmb_db.setCurrentText(current)   # 保留用户原来的输入
 
             db.close()   # 用完就关，不占连接
-            self._set_status(f"读取到 {len(names)} 个数据库，U8 年度库 {len(u8)} 个。", True)
+
+            # 顺便统计年度库数量，用于提示"这台服务器上有几个年度账"
+            u8 = [n for n in names if n.upper().startswith("UFDATA")]
+            self._set_status(
+                f"读取到 {len(names)} 个数据库；其中年度账库 {len(u8)} 个"
+                f"（年度账库无需在此填写，程序会自动定位）。",
+                True,
+            )
         except Exception as exc:  # noqa: BLE001
             # 【新手须知：捕获宽泛异常】
             #   这里故意捕获所有异常并显示给用户，
@@ -356,14 +397,34 @@ class ConnectionDialog(QDialog):
         """
         cfg = self.collect_config()
 
-        # 必填校验：数据库不能为空
-        if not cfg.database:
-            QMessageBox.warning(self, "提示", "请选择或输入要连接的数据库（U8 年度库）。")
+        # 必填校验：系统库不能为空
+        # 【为什么校验 system_database 而不是 database？】
+        #   这个对话框填的是"登录用哪个库"。登录只该进系统库（UFSystem），
+        #   所以必须校验 system_database。database 只是它的同步副本。
+        if not cfg.system_database:
+            QMessageBox.warning(
+                self, "提示",
+                "请填写系统库名（通常是 UFSystem）。\n"
+                "这里不需要填年度库，年度库会在生成报表时自动定位。",
+            )
             return   # return 直接结束函数，对话框保持打开
 
         ok, msg = Database(cfg).test_connection()
         if not ok:
             QMessageBox.critical(self, "连接失败", msg)
+            return
+
+        # 【额外校验：如果用户填的是年度库，提醒他改】
+        #   这种错很容易犯（老习惯就是填 UFDATA_...），而后果很隐蔽：
+        #   连上年度库后照样"连接成功"，但程序随后查不到账套注册表，
+        #   生成时才报错，用户会以为是程序坏了。所以在这一步就点破它。
+        if cfg.system_database.upper().startswith("UFDATA"):
+            QMessageBox.warning(
+                self, "提示",
+                f"您填写的「{cfg.system_database}」看起来是一个年度账库。\n\n"
+                "这里应填系统库（通常为 UFSystem）。年度账库由程序在生成时\n"
+                "根据账套号和年度自动定位，不需要手工填写。",
+            )
             return
 
         self._config = cfg   # 验证通过，更新配置
