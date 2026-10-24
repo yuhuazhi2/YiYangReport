@@ -104,6 +104,113 @@ def _brief_error(exc: Exception) -> str:
     return cleaned
 
 
+# ===========================================================================
+# 只读防线（最重要的一段代码，请重点阅读）
+# ===========================================================================
+# 【背景：这是一个"只负责读账"的工具】
+#   本程序对客户 SQL Server 的唯一合法操作就是 **SELECT 取数**。
+#   它绝不能 INSERT / UPDATE / DELETE，也绝不能建表、改表、删表。
+#   一旦误写了用友的账，后果是财务数据失真、甚至无法对账 —— 没有任何理由这么做。
+#
+# 【为什么不能只靠"我们小心点不写 UPDATE"？】
+#   因为人会犯错、代码会被后来的人改、SQL 也可能从配置或外部拼进来。
+#   "约定"挡不住事故，只有"代码层面的强制拦截"才挡得住。
+#   所以这里做三道防线：
+#
+#     防线① 语句白名单：只允许 SELECT / WITH 开头的语句，其余一律拒绝。
+#     防线② 危险关键字黑名单：连 SELECT ... INTO（会用查询结果建表）也拦掉。
+#     防线③ execute() 直接封印：需要"写入"的方法不再对外提供，调用即报错。
+#
+# 【为什么不干脆删掉 execute() 方法？】
+#   因为删除会让"不小心调用它"的地方变成 AttributeError，报错信息难懂。
+#   保留方法但让它明确拒绝，并给出"这是只读工具"的原因，对维护者更友好。
+
+# 允许的语句开头（去掉空白与小括号后判断）
+_ALLOWED_PREFIXES = ("SELECT", "WITH")
+
+# 出现这些关键字就认为"可能写数据"，直接拒绝。
+# 注意用 \b 做词边界匹配，避免把列名里恰好含有的字母组合误判。
+_FORBIDDEN_PATTERN = re.compile(
+    r"\b("
+    r"INSERT|UPDATE|DELETE|MERGE|"
+    r"DROP|ALTER|CREATE|TRUNCATE|"
+    r"EXEC|EXECUTE|GRANT|REVOKE|DENY|"
+    r"BACKUP|RESTORE|SHUTDOWN|DBCC|"
+    r"INTO"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _strip_sql_noise(sql: str) -> str:
+    """去掉 SQL 里的注释和字符串内容，只留下"真正的语句骨架"。
+
+    【新手难点】为什么不能直接对原始 SQL 做关键字检查？
+        因为下面这些写法都是**合法且无害**的，却会被简单匹配误判：
+            SELECT '...请勿 UPDATE...' AS note FROM t   ← 字符串里含 UPDATE
+            SELECT ccode  -- 这里不要 DELETE
+              FROM Code
+        所以必须先把"注释"和"字符串字面量"抹掉，剩下的才是真正的语法结构。
+        这种"先去噪、再判断"的思路，在处理外部文本时非常常用。
+    """
+    # 第1步：删掉 /* 块注释 */（DOTALL 让 . 也能匹配换行）
+    text = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
+    # 第2步：删掉 -- 行注释（一直到行尾）
+    text = re.sub(r"--[^\n]*", " ", text)
+    # 第3步：删掉单引号字符串，把 'xxx' 换成空字符串占位
+    #   '' 表示"字符串里的单引号是转义的两连写"，所以用 (?:''|[^'])* 匹配内容
+    text = re.sub(r"'(?:''|[^'])*'", "''", text)
+    return text
+
+
+def _assert_select_only(sql: str) -> None:
+    """【防线① + 防线②】执行前校验：不是纯查询就抛异常。
+
+    【新手必学】这个函数"什么都返回不了"，它的作用是"拦人"。
+        在 Python 里，这种"通不过就抛异常"的函数叫**守卫函数**（guard）。
+        调用方不用写 if 判断，只要在开头调一次，后面的代码就安全了：
+            _assert_select_only(sql)   # 通不过这里就抛异常了
+            cur.execute(sql)           # 能走到这一行，说明 SQL 是安全的
+    """
+    body = _strip_sql_noise(sql).strip()
+    if not body:
+        raise DatabaseError("拒绝执行：SQL 为空。")
+
+    # 去掉开头的括号（例如 (SELECT ... ) UNION (SELECT ...)）
+    head = body.lstrip("( \t\r\n").upper()
+
+    # 【防线①】必须是以 SELECT 或 WITH 开头
+    if not head.startswith(_ALLOWED_PREFIXES):
+        raise DatabaseError(
+            "拒绝执行：本工具是只读工具，仅允许 SELECT 查询。"
+            f"（收到的语句开头为：{head[:20]}…）"
+        )
+
+    # 【防线②】不允许出现任何"可能改动数据/结构"的关键字
+    #   包含 INTO：SELECT * INTO 新表会真的建表，必须拦掉。
+    hit = _FORBIDDEN_PATTERN.search(body)
+    if hit:
+        raise DatabaseError(
+            f"拒绝执行：语句中包含危险关键字 [{hit.group(1).upper()}]。"
+            "本工具只读取数，不会修改用友数据库中的任何数据。"
+        )
+
+
+def quote_ident(name: str) -> str:
+    """把"数据库名/表名"安全地包进方括号，防止拼接出语法错误或注入。
+
+    【背景】SQL 的库名、表名属于"标识符"，不能用 ? 占位符传值
+        （占位符只能用于"值"）。所以只能拼字符串。
+        但直接拼很危险：万一名字里有 ] 或 ; 就能破坏语句结构。
+        标准做法是把内部的 ] 双写成 ]]，再用 [] 包起来。
+            普通名字 UFDATA_001_2026  → [UFDATA_001_2026]
+            恶意名字 a];DROP TABLE t-- → [a]];DROP TABLE t--]
+        这样它永远只是一个"普通名字"，不会变成代码。
+    """
+    safe = str(name).replace("]", "]]")
+    return f"[{safe}]"
+
+
 class DatabaseError(Exception):
     """
     自定义异常类。
@@ -306,13 +413,37 @@ class Database:
             用友 U8 通常是"一套账"对应一个数据库，命名类似 UFDATA_001_2026，
             其中 001 是账套号，2026 是年度。
             想查不同年度/账套的数据，切换数据库最方便。
+
+        【重要】这个"切换"**只改变本程序连接的默认库**，
+            不会影响服务器上任何数据，也不会影响其他人正在使用的用友。
         """
         self._ensure_conn()
-        # 【安全提示】库名不能用参数占位符（?）传递，只能拼接到 SQL 里，
-        # 所以用方括号 [] 包住库名，防止特殊字符或 SQL 注入。
-        self._conn.execute(f"USE [{database}]")
-        self.config.database = database     # 同步更新配置，方便下次复用
-        logger.info("已切换数据库：%s", database)
+        # 【安全提示】库名不能用参数占位符（?）传递，只能拼接到 SQL 里。
+        # 用统一的 quote_ident() 包住库名，把潜在的 ] 转义掉，杜绝注入。
+        self._conn.execute(f"USE {quote_ident(database)}")
+        # 同步到配置：让日志与界面能看出"这次真正用的是哪个库"
+        self.config.target_database = database
+        logger.info("已切换取数目标库：%s", database)
+
+    def database_exists(self, database: str) -> bool:
+        """确认某个库在服务器上真实存在（切换前必做的检查）。
+
+        【为什么必须先查存在性，不能直接 USE？】
+            `USE [UFDATA_001_2026]` 如果库不存在，SQL Server 会抛错，
+            但报错文本很技术（"无法打开数据库…"），客户看不懂。
+            更重要的是：如果此时恰好连在别的库上，错误信息会让人以为
+            "是程序坏了"，而不是"你选的账套年度没有对应数据库"。
+            先查一次 sys.databases，就能给出精准、可理解的提示。
+        """
+        rows = self.query(
+            "SELECT COUNT(*) FROM sys.databases WHERE name = ?", [database]
+        )
+        return bool(rows and rows[0][0])
+
+    def current_database(self) -> str:
+        """返回当前连接实际所在的库名（供日志与审计用）。"""
+        row = self.query_one("SELECT DB_NAME()")
+        return str(row[0]) if row else ""
 
     def list_databases(self) -> list[str]:
         """列出所有数据库（用于连接后选择 U8 年度库）。"""
@@ -364,12 +495,16 @@ class Database:
             Optional[Sequence[Any]] 表示"可以是序列，也可以是 None"。
             Optional[X] 等价于 Union[X, None]。
         """
+        # 【防线】执行前先确认这是纯查询语句，不是删改数据的语句。
+        #   这一步放在最前面：任何非法 SQL 在碰到数据库之前就被拦下了。
+        _assert_select_only(sql)
+
         self._ensure_conn()
         start = time.perf_counter()   # 开始计时（高精度计时器）
         try:
             cur = self._conn.cursor()
             if database:
-                cur.execute(f"USE [{database}]")
+                cur.execute(f"USE {quote_ident(database)}")
             # params 为 None 时用空列表代替，避免 pyodbc 报错
             cur.execute(sql, params or [])
             rows = cur.fetchall()                 # 取出所有结果行
@@ -401,12 +536,13 @@ class Database:
             组合起来就是"把一行数据包装成 {列名: 值}"。
             这就是为什么取数时用 query_dict 更方便——可以直接 row["cName"]。
         """
+        _assert_select_only(sql)      # 【防线】同上：只读校验
         self._ensure_conn()
         start = time.perf_counter()
         try:
             cur = self._conn.cursor()
             if database:
-                cur.execute(f"USE [{database}]")
+                cur.execute(f"USE {quote_ident(database)}")
             cur.execute(sql, params or [])
             # cur.description 包含结果集的列信息，d[0] 是列名
             cols = [d[0] for d in cur.description]
@@ -443,24 +579,25 @@ class Database:
     def execute(self, sql: str, params: Optional[Sequence[Any]] = None,
                 tag: str = "") -> int:
         """
-        执行非查询语句（INSERT/UPDATE/DELETE/建表等），返回受影响行数。
+        【防线③：本方法已被永久封印，调用即报错】
 
-        【注意】本项目主要做"读账"，一般不会用到这个方法写用友的库，
-        保留它是为了通用性（比如创建临时表、临时视图辅助取数）。
+        【为什么保留这个方法而不是删掉？】
+            这个工具对客户数据库**只允许 SELECT 取数**，
+            绝不修改用友的任何数据。保留一个"名字还在、但一定会拒绝"的方法，
+            比直接删掉更好：将来若有人习惯性地写下 db.execute("UPDATE ...")，
+            他会立刻收到一条明确的、说明原因的报错，
+            而不是一个难以理解的 AttributeError。
+
+        【历史说明】
+            早期版本这里确实能执行 INSERT/UPDATE/DELETE，
+            用来"建临时表辅助取数"。但那是危险的设计：
+            临时表也会在客户库里留下痕迹，且一旦 SQL 写错就可能伤到真数据。
+            现在改为：需要中间结果时，全部在 Python 内存里算，不碰数据库结构。
         """
-        self._ensure_conn()
-        start = time.perf_counter()
-        try:
-            cur = self._conn.cursor()
-            cur.execute(sql, params or [])
-            n = cur.rowcount    # 受影响行数
-            elapsed = time.perf_counter() - start
-            SQLAudit.record(sql, params, elapsed, n, tag=tag)
-            return n
-        except Exception as exc:
-            elapsed = time.perf_counter() - start
-            SQLAudit.record(sql, params, elapsed, 0, error=str(exc), tag=tag)
-            raise DatabaseError(f"执行失败：{_brief_error(exc)}") from exc
+        raise DatabaseError(
+            "拒绝执行：本工具对用友数据库只做只读取数，"
+            "不允许执行 INSERT/UPDATE/DELETE/建表/改表等任何写操作。"
+        )
 
     # ------------------------------------------------------------------
     # 元数据辅助（"元数据"= 描述数据的数据，比如有哪些表、表里有哪些列）

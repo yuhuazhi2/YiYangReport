@@ -136,7 +136,26 @@ class ConnectionConfig:
     server: str = "localhost"          # 服务器地址，如 192.168.1.10 或 localhost
     instance: str = ""                  # 实例名，如 SQLEXPRESS；默认实例留空
     port: int = 1433                    # 端口。1433 是 SQL Server 默认端口
-    database: str = ""                  # 默认数据库（U8 年度库，如 UFDATA_001_2026）
+
+    # 【重要：database 的含义已经变了】
+    #   以前这里填的是"年度库"（如 UFDATA_001_2026），要求客户自己记住库名，
+    #   一旦填错，程序就会安安静静地查错账套的数据 —— 这是最危险的情况。
+    #
+    #   现在这里填的是**登录时连的库**，固定为用友系统库（默认 UFSystem）。
+    #   年度库不再由人填写，而是在生成时由"账套号 + 会计年度"自动解析出来
+    #   （解析规则见 core/u8_account.py，数据来自 UFSystem.dbo.UA_AccountDatabase）。
+    database: str = "UFSystem"
+
+    # 用友系统库（账套注册库）的名字。
+    # 绝大多数现场都叫 UFSystem，但个别改过库名的环境可以在这里调整，
+    # 程序查账套表时会用这个库名做三段式限定。
+    system_database: str = "UFSystem"
+
+    # 运行时解析出来的年度库（如 UFDATA_001_2026）。
+    # 【说明】它不是让用户填的，而是每次生成前根据账套号+年度查出来再写进来。
+    #   存进配置只是为了日志能看出"上次用的是哪个库"，不参与任何判断。
+    target_database: str = ""
+
     username: str = ""                  # SQL 登录名
     password: str = ""                  # SQL 登录密码（内存中为明文；存盘时会加密）
     use_windows_auth: bool = False      # 是否使用 Windows 集成认证
@@ -177,8 +196,12 @@ class ConnectionConfig:
             f"DRIVER={{{driver}}}",   # 驱动名两边要加大括号（驱动名本身含空格）
             f"SERVER={server_part}",
         ]
-        if self.database:
-            parts.append(f"DATABASE={self.database}")
+        # 【关键】连接时只进系统库，不进年度库。
+        #   原因：账套与年度的对应关系必须先查系统库才知道，
+        #   在"还不知道该连哪个年度库"的时候，直接连年度库是无从谈起的事。
+        login_db = self.system_database or self.database
+        if login_db:
+            parts.append(f"DATABASE={login_db}")
 
         # 认证方式二选一
         if self.use_windows_auth:
@@ -363,6 +386,13 @@ def load_config() -> AppConfig:
         if k in ConnectionConfig.__dataclass_fields__
     })
     # 上面的 {...} 是"字典推导式"，**conn 是把字典当作关键字参数传入构造函数
+
+    # 【旧配置迁移】老版本的 database 里存的是年度库（UFDATA_xxx_yyyy）。
+    #   如果直接沿用，程序就会"登录就进了某个年度库"，
+    #   万一那个库已被删除或改名，连测试连接都会失败。
+    #   所以这里自动纠正为系统库，让新逻辑从干净状态开始。
+    if conn.database.upper().startswith("UFDATA"):
+        conn.database = conn.system_database
 
     return AppConfig(
         connection=conn,
