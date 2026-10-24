@@ -122,16 +122,33 @@ class ReportContext:
                 → ... → LK33 → 生成结束（对象被丢弃）
     """
 
-    def __init__(self, db: Database, period: Period, account_set: str = "001"):
+    def __init__(self, db: Database, period: Period, account_set: str = "001",
+                 target_database: str = ""):
         """
         参数：
-            db          : 已连接的 Database 对象。
-            period      : 会计期间（Period）。
-            account_set : 账套号，默认 "001"。
+            db              : 已连接的 Database 对象。
+            period          : 会计期间（Period）。
+            account_set     : 账套号，默认 "001"。
+            target_database : 本次取数的年度库（如 UFDATA_001_2026）。
+
+        【新手必学：为什么上下文必须知道"目标库"？】
+            生成流程开始前，core/u8_account.py 已按"账套号 + 年度"
+            解析出唯一的年度库，并把连接切了过去。
+            但 43 张报表在 fetch 时**并不知道**自己该查哪个库 ——
+            它们只知道"我要一张科目余额表"。
+
+            如果上下文不把目标库记住并默认带上，就会出现两种糟糕情况：
+              ① database 参数为空 → 沿用连接的当前库（碰巧对了，靠运气）；
+              ② 某张报表显式传了库名 → 可能传错（查了别家的账）。
+
+            所以让上下文持有 target_database，并在每一次查询时显式指定它。
+            "每一次都写明白查哪个库"，不依赖任何隐式状态 —— 这比"碰巧对"可靠。
         """
         self.db = db
         self.period = period
         self.account_set = account_set
+        # 本次生成固定使用的年度库；空字符串表示"不指定（沿用连接当前库）"。
+        self.target_database = target_database
 
         # _cache：真正的取数缓存。键是字符串，值是查询结果（行列表）。
         self._cache: dict[str, Any] = {}
@@ -173,6 +190,23 @@ class ReportContext:
 
         return f"{db_part}{table}:{self.period.key}:{arg_part}"
 
+    def _key_with_db(self, key: str, database: str) -> str:
+        """给缓存键补上库名前缀，确保"不同年度库的缓存绝不串用"。
+
+        【新手难点：不补前缀会怎样？】
+            假设程序在同一次运行里先生成 2026 年的报表、再生成 2025 年的。
+            两次的缓存键若都叫 "GL_accsum:2026-05"，第二次就会**直接命中**
+            第一次的结果，于是 2025 年的报表里填的其实是 2026 年的钱 ——
+            而且全过程不报任何错。这类错误极难发现，必须在键上就杜绝。
+
+            前缀只加一次（用 startswith 判断），避免报表自己已经用
+            make_key(database=...) 生成过键时出现 "库.库.表" 这种重复前缀。
+        """
+        if not database:
+            return key
+        prefix = f"{database}."
+        return key if key.startswith(prefix) else f"{prefix}{key}"
+
     def cache_get(self, key: str) -> Optional[Any]:
         """取出缓存。没缓存过时返回 None。"""
         # 【新手必学：dict.get()】
@@ -207,22 +241,32 @@ class ReportContext:
             key         : 缓存键（建议用 make_key 生成）。
             sql         : 要执行的 SQL。
             params      : SQL 参数。
-            database    : 可选的数据库名。
+            database    : 可选。不传则自动使用上下文的目标库。
             report_code : 哪张报表发起的取数（记入审计，便于核对）。
 
         【流程】
             先看缓存 → 命中则秒回
                     → 未命中则查库 → 结果存缓存 + 记账 → 返回
+
+        【新手难点：target = database or self.target_database 的"逐级回退"】
+            优先级从高到低：
+                ① 报表**显式**指定的库（极少数需要跨库对比的特殊表）
+                ② 上下文的**统一目标库**（99% 的情况走这条）
+                ③ 空值 → 沿用连接当前库（仅在无目标库时出现，如开发调试）
+            这样"不传库名也一定查对库"，而不是"不传就随缘"。
         """
+        target = database or self.target_database or ""
+        key = self._key_with_db(key, target)
         if key in self._cache:
             return self._cache[key]
 
         start = time.perf_counter()
-        # database 为空字符串时传 None，因为 Database.query 约定用 None 表示"不切换库"
+        # target 为空字符串时传 None，因为 Database.query 约定"None = 不切换库"
         # 【关键】tag=report_code：把"哪张报表发的查询"带给审计日志，
         #   这样 sql_audit.log 里每行都能看出归属，出问题时可按报表代码直接筛。
         #   注意它只进日志文件，不会出现在界面【运行日志】里。
-        rows = self.db.query(sql, params, database=database or None, tag=report_code)
+        rows = self.db.query(sql, params,
+                             database=target or None, tag=report_code)
         elapsed = time.perf_counter() - start
 
         self._cache[key] = rows
@@ -243,12 +287,15 @@ class ReportContext:
 
         和 fetch 的区别只在于底层调用了 db.query_dict，
         返回的是 [{列名: 值}, ...]，方便按列名取值。
+        库的选择规则与 fetch 完全一致（见上面的"逐级回退"说明）。
         """
+        target = database or self.target_database or ""
+        key = self._key_with_db(key, target)
         if key in self._cache:
             return self._cache[key]
 
         start = time.perf_counter()
-        rows = self.db.query_dict(sql, params, database=database or None,
+        rows = self.db.query_dict(sql, params, database=target or None,
                                   tag=report_code)
         elapsed = time.perf_counter() - start
 

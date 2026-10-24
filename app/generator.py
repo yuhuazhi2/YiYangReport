@@ -37,6 +37,7 @@ from core.db import Database, _brief_error
 from core.excel_engine import ExcelEngine, ExcelEngineError
 from core.logging_setup import get_logger
 from core.template import SheetInfo, TemplateParser
+from core.u8_account import AccountResolveError, resolve_account_database
 from reports import registry
 
 logger = get_logger(__name__)
@@ -160,16 +161,59 @@ class ReportGenerator:
         db = Database(self.config.connection)
         period = Period(self.config.fiscal_year, self.config.fiscal_month)
 
+        connected = True
         try:
             db.connect()
         except Exception as exc:
+            connected = False
             # 【设计选择】允许无数据库时生成"骨架报表"（用于调试模板复制）。
             # 好处：开发期没配数据库也能验证"表页复制、另存"是否正常。
             # 注意：此时各报表的取数会失败，但框架不会崩。
             logger.warning("数据库连接失败，将生成空报表：%s", exc)
 
+        # ===== 第2.5步：确定"这次到底查哪个年度库"（本项目的命门）=====
+        # 【为什么这一步绝不能省？】
+        #   用友一个账套一年一个库（UFDATA_001_2026）。"账套号 + 年度"
+        #   唯一决定该查哪个库。如果这一步不做，连接会停在登录库上，
+        #   各报表查的可能是**别的账套/别的年度**的数据 —— 而且不会报错，
+        #   只会安安静静输出一份错账。所以：解析不出来，就绝不往下生成。
+        target_db = ""
+        if connected:
+            try:
+                target = resolve_account_database(
+                    db,
+                    self.config.account_set,
+                    self.config.fiscal_year,
+                    system_database=self.config.connection.system_database or "UFSystem",
+                )
+                target_db = target.database
+                # 记到配置里，界面与日志就能显示"本次用的是哪个库"
+                self.config.connection.target_database = target_db
+                # 【为什么进度文字里不写库名？】
+                #   进度条下方那行字是给财务人员看的，
+                #   UFDATA_001_2026 这种库名他们不认识，也不需要认识。
+                #   但他们**需要知道**"程序找的是哪个账套、哪一年"，
+                #   这句话正好把这两点说清楚，让他们对数据来源放心。
+                #   （真正的库名已由上面那行 logger 记进 logs/app.log，
+                #     维护者排错时能看到，客户看不到。）
+                self._report(
+                    0, 1, "",
+                    f"已确认数据源：账套 {target.account_set} / {target.year} 年",
+                )
+            except AccountResolveError as exc:
+                # 【关键设计：失败就停，不生成半成品】
+                #   如果这里"容错继续"，客户会拿到一份数字全错的报表，
+                #   并且以为它是真的。宁可什么都不给，也不能给错的。
+                logger.error("账套库解析失败：%s", exc)
+                result.message = str(exc)
+                db.close()
+                result.elapsed = time.perf_counter() - start
+                return result
+
         # 上下文：贯穿本次生成，负责缓存与审计（详见 core/context.py）
-        ctx = ReportContext(db, period, self.config.account_set)
+        # 把 target_db 传进去：之后 43 张报表的每一次取数都会显式打这个库。
+        ctx = ReportContext(db, period, self.config.account_set,
+                            target_database=target_db)
 
         # ===== 第3步：加载内置报表模块 =====
         # 【新手难点】这行只是在"import 模块"，但它会触发各报表类上的
