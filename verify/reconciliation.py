@@ -184,9 +184,26 @@ class Reconciler:
             val = data[key]
             if val is None:
                 raise KeyError(f"{code}.{key} 为空")
-            # 【重要】用括号包住数值，避免替换后运算优先级出错
+            # 【重要：必须能转成数字，否则视为"数据不可用于核对"】
+            #   踩坑记录：某报表把指标地址写到了表头文字格上，
+            #   读回来的值是 "期末余额" 这种字符串，float() 直接抛
+            #   ValueError。若不在此处拦住，异常会一路冒到
+            #   app/generator 的勾稽环节，导致"整份核对报告"全部丢失
+            #   （日志里就是 could not convert string to float）。
+            #
+            #   按设计约定，核对有三种结果，其中"无法核对"不是失败：
+            #       True  = 相符
+            #       False = 不符（要报）
+            #       None  = 数据不可用/缺失（跳过，不误报）
+            #   所以这里统一抛 KeyError，由上层的 except KeyError
+            #   转成"无法核对"，而不是让 ValueError 逃出去。
+            try:
+                num = float(val)
+            except (TypeError, ValueError):
+                raise KeyError(f"{code}.{key} 不是数值（{val!r}）")
+            # 用括号包住数值，避免替换后运算优先级出错
             #   例如 "a + b" 替换成 "1 + 2"，若原本是 "a * 2" 就成 "1 + 2 * 2" 了
-            return f"({float(val)})"
+            return f"({num})"
 
         try:
             # 正则解释：([A-Za-z]\w*)\.([^\s+\-*/()]+)

@@ -66,7 +66,8 @@ def _find_cell(hook: _SheetHook, keyword: str, max_row: int = 8) -> tuple[int, i
 
 
 def fill_common_header(hook: _SheetHook, ctx: ReportContext,
-                       company_name: str = "") -> None:
+                       company_name: str = "",
+                       fill_period: bool = True) -> None:
     """
     填写通用页眉。
 
@@ -74,6 +75,17 @@ def fill_common_header(hook: _SheetHook, ctx: ReportContext,
     - 公司名称：<公司名>
     - 会计期间：<年>年<月>月
     保留原标识文字，仅在其后追加取值。
+
+    【参数 fill_period：给个别表页自己填会计期间的机会】
+        默认 True = 按通用规则，把"会计期间：2026年5月"写回标签所在格。
+
+        但有些表页有明确的需求指定了另一个位置。例如 LK01 要求把
+        会计期间写到 C4 格（而"会计期间："标签在 C1）。若这里仍按通用
+        规则写一遍 C1、报表里又写一遍 C4，同一页就会出现两处年月 ——
+        财务人员看到会以为数据重复或程序出错。
+
+        所以这类表页调用本函数时传 fill_period=False，
+        把"写哪里"的决定权完全交给该报表自己。
 
     【新手必学：位置解包的写法】
         pos = _find_cell(...)
@@ -90,11 +102,24 @@ def fill_common_header(hook: _SheetHook, ctx: ReportContext,
     if pos and company_name:
         r, c = pos
         # 保留"公司名称:"这个标识，冒号后追加实际公司名
-        hook.set_rc(r, c, f"公司名称:{company_name}")
+        #
+        # 【为什么用 set_text_rc 而不是 set_rc？】
+        #   页眉里很多格子被模板设成了金额/日期格式。用普通写入时，
+        #   Excel 会把 "2026年5月" 识别成日期并存成序列号 46143，
+        #   再按金额格式显示成 46,143.00（LK01 的 C4 就是这么踩的坑）。
+        #   公司名一般不触发这种识别，但同一段代码统一用文本写入更稳妥，
+        #   不必逐个字段去猜"这个值会不会被 Excel 误判"。
+        hook.set_text_rc(r, c, f"公司名称:{company_name}")
 
     # 会计期间
-    pos = _find_cell(hook, _KEYWORD_PERIOD)
-    if pos:
-        r, c = pos
-        # 用 ctx.period 里的年月拼出"会计期间：2026年5月"
-        hook.set_rc(r, c, f"会计期间：{ctx.period.year}年{ctx.period.month}月")
+    # 【新手须知】fill_period 为 False 时整段跳过，交回给报表自己写。
+    if fill_period:
+        pos = _find_cell(hook, _KEYWORD_PERIOD)
+        if pos:
+            r, c = pos
+            # 用 ctx.period 里的年月拼出"会计期间：2026年5月"
+            # 【务必用 set_text_rc】年月文字若用普通写入，会被 Excel
+            #   当成日期、存成序列号，再按该格原有格式显示成一串数字。
+            hook.set_text_rc(
+                r, c, f"会计期间：{ctx.period.year}年{ctx.period.month}月"
+            )

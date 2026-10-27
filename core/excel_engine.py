@@ -536,13 +536,61 @@ class _SheetHook:
     # ---- 写 ----
     def set(self, cell: str, value) -> None:
         """
-        按 A1 记法写单元格。
+        按 A1 记法写单元格（普通写入，交给 Excel 自行判断类型）。
 
         【新手必学：A1 记法】
             "B5" 表示第 B 列、第 5 行。
             字母是列，数字是行。这是 Excel 的通用写法。
+
+        【警告：写文字请改用 set_text()】
+            Excel 的 .Value 赋值会"猜类型"：写 "2026年5月" 会被当成日期，
+            单元格内部存的其实是序列号 46143，若该格又是金额格式，
+            就会显示成 46,143.00。详见 set_text() 的说明。
         """
         self.ws.Range(cell).Value = value
+
+    def set_text(self, cell: str, value) -> None:
+        """
+        按 A1 记法写"纯文本"单元格，防止被 Excel 自动识别成日期或数字。
+
+        【为什么必须要有这个方法？（真实踩坑记录）】
+            需求要求把会计期间写进 LK01 的 C4。代码写的是字符串
+            "2026年5月"，但生成出来的报表里 C4 显示的是 46,143.00。
+
+            原因不是取数错，而是 Excel 的两步"自作聪明"：
+              ① Range.Value 赋值会做类型识别，"2026年5月" 被理解成
+                 日期 2026-05-01，内部存成日期序列号 46143
+                 （Excel 里 1 = 1900-01-01，所以 2026-05-01 正好是 46143）；
+              ② C4 这一格在模板里被设成了金额格式
+                 （#,##0.00 千分位两位小数），于是 46143 被渲染成
+                 "46,143.00" —— 看起来就像一笔莫名其妙的钱。
+
+        【解决：两步，且顺序绝对不能反】
+              ① 先把该格的数字格式设为文本 "@"
+              ② 再写入字符串
+            如果反过来（先写值、后改格式），值早已变成序列号 46143，
+            改格式只能让它显示成 "46143"，仍然不是年月。
+
+        【适用范围】
+            页眉里的"会计期间""公司名称""制表""复核"这类纯文字信息，
+            都应使用本方法写入，不要用 set()。
+        """
+        rng = self.ws.Range(cell)
+        # 第①步：设为文本格式（"@" 是 Excel 里"文本"的格式代码）
+        rng.NumberFormat = "@"
+        # 第②步：写入字符串。None 统一写空串，避免 Excel 显示成 0
+        rng.Value = "" if value is None else str(value)
+
+    def set_text_rc(self, row: int, col: int, value) -> None:
+        """
+        按"行列号"写纯文本单元格（1-based），作用同 set_text()。
+
+        【用途】需要按行列定位、又不想被识别成日期时用这个。
+                例如页眉里的"会计期间："标签所在格。
+        """
+        cell = self.ws.Cells(row, col)
+        cell.NumberFormat = "@"
+        cell.Value = "" if value is None else str(value)
 
     def set_rc(self, row: int, col: int, value) -> None:
         """
@@ -622,6 +670,240 @@ class _SheetHook:
     def used_cols(self) -> int:
         """已使用区域的列数。"""
         return self.ws.UsedRange.Columns.Count
+    # ==================================================================
+    # 【框架扩展区】为 43 张报表长期开发预留的通用能力
+    # ------------------------------------------------------------------
+    # 说明：下面这些方法不是"某一张表的特殊需求"，而是从 43 张表
+    #      的实际结构中归纳出来的共性能力。放在框架层，好处是：
+    #        · 后续 40 张表开发时不必各写一套；
+    #        · 模板版式微调时，改一处即可适配全部报表。
+    # ==================================================================
+
+    # ---- 批量写（性能关键）----
+    def set_block(self, row: int, col: int, rows: Sequence[Sequence]) -> int:
+        """
+        从 (row, col) 开始写入一个"二维表格块"（多行多列一次写完）。
+
+        参数：
+            row  : 起始行号（1-based）
+            col  : 起始列号（1-based）
+            rows : 二维序列，如 [[100, 200], [300, 400]]
+        返回：实际写入的数据行数。
+
+        【为什么需要它？】
+            明细类报表（往来、存货、固定资产）常一次写几十上百行。
+            逐格调用 set_rc() 会发起成百上千次跨进程 COM 调用，
+            在"局域网 + 真实 Excel"环境下明显变慢。
+            整块赋值只走一次 COM，快很多。
+
+        【新手必学】
+            self.ws.Range(左上, 右下).Value = 二维元组
+            这是 Excel 最高效的写入方式。要求目标区域的
+            行列数与数据完全一致，否则会错位或报错。
+        """
+        data = list(rows)
+        if not data:
+            return 0
+
+        n_rows = len(data)
+        n_cols = max((len(r) for r in data), default=0)
+        if n_cols == 0:
+            return 0
+
+        # 【关键】补齐成矩形：Excel 要求每行列数一致
+        matrix = []
+        for r in data:
+            row_vals = list(r) + [""] * (n_cols - len(r))
+            matrix.append(tuple(row_vals))
+
+        top_left = self.ws.Cells(row, col)
+        bottom_right = self.ws.Cells(row + n_rows - 1, col + n_cols - 1)
+        self.ws.Range(top_left, bottom_right).Value = tuple(matrix)
+        return n_rows
+
+    def set_formula(self, cell: str, formula: str) -> None:
+        """
+        写入 Excel 公式（不是值）。
+
+        参数：
+            cell    : 单元格地址，如 "C20"
+            formula : 公式文本，必须以等号开头，如 "=SUM(C8:C19)"
+
+        【使用场景】
+            动态插行后，原来写死的合计公式（如 =SUM(C8:C14)）
+            范围就不够了，需要按实际行数重写。
+
+        【新手易错点】
+            公式必须用 Formula 属性赋值。若用 Value，Excel 会把
+            "=SUM(...)" 当纯文本显示出来。
+        """
+        self.ws.Range(cell).Formula = formula
+
+    # ---- 批量读 ----
+    def get_block(self, row: int, col: int, n_rows: int,
+                  n_cols: int) -> list[tuple]:
+        """
+        读取一个矩形区域，返回二维数据。用于核对与调试。
+        """
+        top_left = self.ws.Cells(row, col)
+        bottom_right = self.ws.Cells(row + n_rows - 1, col + n_cols - 1)
+        raw = self.ws.Range(top_left, bottom_right).Value
+        # 单个单元格时返回标量而非二维元组，统一包装
+        if not isinstance(raw, tuple):
+            return [(raw,)]
+        return [tuple(r) if isinstance(r, tuple) else (r,) for r in raw]
+
+    # ---- 按内容定位（应对模板版式微调）----
+    def find_row(self, keyword: str, col: int = 1, start_row: int = 1,
+                 max_row: int = 0, exact: bool = False) -> int:
+        """
+        在指定列中查找包含关键字的行，返回行号（1-based）；找不到返回 0。
+
+        参数：
+            keyword   : 要找的文字，如 "货币资金"
+            col       : 在哪一列找（1-based，默认第 1 列）
+            start_row : 起始行（默认 1）
+            max_row   : 终止行；0 表示用已使用区域的行数
+            exact     : True=完全相等；False=包含即算（默认）
+
+        【为什么这是框架级能力？】
+            43 张表的行项目位置各不相同，模板将来也可能微调。
+            若每张表都写死"第 15 行是货币资金"，模板一挪行，
+            全部报表同时失效，而且数字会悄悄写到别的行上。
+
+            改为按项目名称定位后：
+              · 模板挪行，代码不用改；
+              · 代码自解释（找"货币资金"比找"第15行"直观）。
+
+        【性能提示】
+            单表几百行的字符串比较可忽略不计。
+            若同一关键字要反复定位，建议报表内自行缓存结果。
+        """
+        key = str(keyword).strip()
+        if not key:
+            return 0
+
+        end_row = max_row if max_row > 0 else self.used_rows
+        for r in range(start_row, end_row + 1):
+            v = self.get_rc(r, col)
+            if v is None:
+                continue
+            text = str(v).strip()
+            if not text:
+                continue
+            if (text == key) if exact else (key in text):
+                return r
+        return 0
+
+    def find_cell(self, keyword: str, start_row: int = 1, max_row: int = 0,
+                  max_col: int = 0) -> tuple[int, int]:
+        """
+        查找包含关键字的单元格，返回 (行, 列)；找不到返回 (0, 0)。
+
+        【新手难点：为什么返回 (0,0) 而不是 None？】
+            调用方通常紧接着解包：r, c = hook.find_cell(...)。
+            若返回 None，解包会抛 TypeError；返回 (0,0) 后可以写
+            "if r == 0: 跳过"，处理方式统一，不易漏判。
+        """
+        key = str(keyword).strip()
+        if not key:
+            return (0, 0)
+
+        end_row = max_row if max_row > 0 else self.used_rows
+        end_col = max_col if max_col > 0 else self.used_cols
+        for r in range(start_row, end_row + 1):
+            for c in range(1, end_col + 1):
+                v = self.get_rc(r, c)
+                if v is None:
+                    continue
+                if key in str(v):
+                    return (r, c)
+        return (0, 0)
+
+    # ---- 动态行（数据量超出模板预留行数时）----
+    def insert_rows(self, row: int, count: int = 1,
+                    copy_from: int = 0) -> int:
+        """
+        在第 row 行之前插入 count 行；可把 copy_from 行的格式复制过来。
+
+        参数：
+            row       : 在第几行之前插入（1-based）
+            count     : 插入几行
+            copy_from : 格式样板行（1-based）；0 表示不复制格式
+        返回：实际插入行数。
+
+        【为什么必须复制格式？】
+            Excel 插入空行时不带边框、不带数字格式。直接写数会导致
+            报表"缺框线"，与模板风格不一致，财务人员一眼能看出异常。
+
+            标准做法：插入空行 → 刷样板行格式 → 再写数据。
+            本方法把前两步合并，调用方只需传 copy_from。
+
+        【务必注意：插入后行号会整体下移】
+            原本第 row 行及其后内容都会 +count。
+            调用方必须按"新行号"计算后续所有位置（尤其是合计行）。
+        """
+        if count <= 0:
+            return 0
+
+        for _ in range(count):
+            self.ws.Rows(f"{row}:{row}").Insert(Shift=1, CopyOrigin=0)
+
+        if copy_from > 0:
+            src = self.ws.Rows(f"{copy_from}:{copy_from}")
+            dst = self.ws.Rows(f"{row}:{row + count - 1}")
+            src.Copy()
+            dst.PasteSpecial(Paste=-4122)   # xlPasteFormats：只贴格式
+            # 【新手须知】必须清掉 Excel 的"剪切副本"状态，
+            #   否则界面会残留闪烁虚线框，后续粘贴也可能受影响。
+            try:
+                self.ws.Application.CutCopyMode = False
+            except Exception:
+                pass
+
+        return count
+
+    def delete_rows(self, row: int, count: int = 1) -> int:
+        """
+        从第 row 行起删除 count 行（1-based）。返回实际删除行数。
+
+        典型用途：模板预留 30 行空位、实际只有 5 条数据时，
+                  删掉多余空行让报表干净。
+        """
+        if count <= 0:
+            return 0
+        self.ws.Rows(f"{row}:{row + count - 1}").Delete()
+        return count
+
+    # ---- 合并单元格 ----
+    def merge(self, row1: int, col1: int, row2: int, col2: int) -> None:
+        """把 (row1,col1) 到 (row2,col2) 的区域合并（1-based）。"""
+        top_left = self.ws.Cells(row1, col1)
+        bottom_right = self.ws.Cells(row2, col2)
+        self.ws.Range(top_left, bottom_right).Merge()
+
+    def unmerge(self, row1: int, col1: int, row2: int, col2: int) -> None:
+        """取消指定区域的合并。"""
+        top_left = self.ws.Cells(row1, col1)
+        bottom_right = self.ws.Cells(row2, col2)
+        self.ws.Range(top_left, bottom_right).UnMerge()
+
+    # ---- 区域边界 ----
+    def used_range(self) -> tuple[int, int, int, int]:
+        """
+        返回已使用区域 (起始行, 起始列, 结束行, 结束列)，均为 1-based。
+
+        【踩坑提示：UsedRange 会"虚胖"】
+            某区域即使内容已清空，只要曾被格式化过，Excel 仍算它已使用。
+            所以不要用它判断"有没有数据"，它的用途是给出安全扫描边界。
+        """
+        ur = self.ws.UsedRange
+        r1 = int(ur.Row)
+        c1 = int(ur.Column)
+        r2 = r1 + int(ur.Rows.Count) - 1
+        c2 = c1 + int(ur.Columns.Count) - 1
+        return (r1, c1, r2, c2)
+
 
 
 def check_excel_available() -> tuple[bool, str]:

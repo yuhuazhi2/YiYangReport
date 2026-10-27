@@ -137,27 +137,106 @@ def implemented_codes() -> list[str]:
     return sorted(_REGISTRY.keys())
 
 
+# =====================================================================
+# 加载失败记录：{模块名: 失败原因}
+#
+# 【为什么框架层要专门记这个？】
+#   本项目要分 43 个阶段逐步开发报表。若某一张表的模块写错了
+#   （语法错、引用了不存在的库、字段名拼错），它绝不能拖累
+#   其余已开发好的报表 —— 否则今天改 LK20 就把 LK01 弄坏了，
+#   越往后越不敢动，项目必然失控。
+#
+#   所以这里采取"逐个隔离加载"：
+#     ① 自动扫描 reports/ 目录下所有 lk*.py；
+#     ② 每个模块单独 try/except 导入；
+#     ③ 失败只记录、只降级为占位报表，不影响其他模块；
+#     ④ 界面上能查"哪几张表加载失败了、为什么"。
+# =====================================================================
+_LOAD_FAILURES: dict[str, str] = {}
+
+
+def load_failures() -> dict[str, str]:
+    """返回本次运行中加载失败的报表模块及其原因（副本）。"""
+    return dict(_LOAD_FAILURES)
+
+
 def load_builtin_reports() -> None:
     """
-    导入内置报表模块，以触发 @register 注册。
+    加载内置报表模块，触发 @register 注册（自动扫描 + 逐个隔离加载）。
 
     【新手难点：为什么"仅仅 import"就能完成注册？】
         Python 首次 import 某模块时，会从头到尾执行该模块代码。
-        而 LK01 模块里写着 @register class LK01Report，
+        而报表模块里写着 @register class LKxxReport，
         执行到这里就会调用 register() 把类塞进 _REGISTRY。
-        所以我们"只要 import，就完成了注册"——这就是这种写法的巧妙之处。
+        所以我们"只要 import，就完成了注册"。
 
-    【为什么用 try/except 包住？】
-        开发初期，某些报表模块可能还没写好、或引用了不存在的库。
-        用 try 包住，保证"加载失败也只是少一张表"，不影响整体运行。
+    【本函数的设计要点：43 张表必须彼此独立】
+        本项目分 43 个阶段逐步开发。如果采用"在文件里逐个手写 import"
+        的老写法，会有三个致命问题：
+          ① 每加一张表都要改本文件（改得越多，越容易碰坏别人的表）；
+          ② 某张表写错语法/引用错库，会让整个 import 链中断，
+             导致连已经做好的表都加载不出来；
+          ③ 无法知道"到底哪几张没加载成功、为什么"。
+
+        现在的做法：
+          ① 自动扫描 reports/ 目录下的 lk*.py，无需改本文件；
+          ② 每个模块在独立的 try/except 中导入，互不影响；
+          ③ 失败原因记进 _LOAD_FAILURES，界面可查；
+          ④ 失败的表现在没有实现类，会自动退化为占位报表
+             （表页照样复制、只是不填数），整体流程不中断。
+
+        这就是"新增一张表 = 新增一个文件"的落地方式，
+        也是保证 43 张表长期并行开发不互相踩踏的基础。
     """
-    # 已实现的报表模块（逐步添加）
+    import importlib
+    import pkgutil
+    from pathlib import Path
+
+    # 清空上一轮的失败记录，允许重复调用（例如界面点"重新加载"）
+    _LOAD_FAILURES.clear()
+
+    # 定位 reports 包所在目录
+    pkg_dir = Path(__file__).resolve().parent
+
+    # 【新手必学：pkgutil.iter_modules】
+    #   它列出某个目录下可被导入的子模块（不递归）。
+    #   这里只取以 "lk" 开头的模块（约定：报表实现文件一律叫 lkXX_xxx.py），
+    #   从而自动跳过 registry / base / stub / header 等框架文件。
+    module_names: list[str] = []
+    for info in pkgutil.iter_modules([str(pkg_dir)]):
+        name = info.name
+        if name.startswith("lk") and not name.startswith("lk_"):
+            module_names.append(name)
+
+    # 按名称排序，让加载顺序稳定、日志可读
+    module_names.sort()
+
+    loaded: list[str] = []
+    for name in module_names:
+        try:
+            # 【关键】逐个独立导入。任何一张表出错，只影响它自己。
+            importlib.import_module(f"reports.{name}")
+            loaded.append(name)
+        except Exception as exc:      # noqa: BLE001
+            # 【为什么捕获 Exception 而不是只捕 ImportError？】
+            #   报表模块里的错误五花八门：语法错(SyntaxError)、
+            #   引用了不存在的名字(NameError)、类属性写错(ValueError,
+            #   如 register 检查 code 为空)、甚至数据文件缺失(OSError)。
+            #   想让"一张表坏掉不拖累其他表"，就必须把所有异常都接住。
+            _LOAD_FAILURES[name] = f"{type(exc).__name__}: {exc}"
+            # 用 warning 而非 debug：这类问题需要维护者知道
+            logger.warning("报表模块 %s 加载失败（不影响其他表）：%s", name, exc)
+
+    if loaded:
+        logger.info("报表模块已加载 %d 个：%s", len(loaded), "、".join(loaded))
+    if _LOAD_FAILURES:
+        logger.warning("有 %d 个报表模块加载失败：%s",
+                       len(_LOAD_FAILURES), "、".join(_LOAD_FAILURES))
+
+    # 兼容旧版本：此前的实现是硬编码 import 这一个模块。
+    # 现在由上面的自动扫描覆盖，但保留一次兜底导入，
+    # 防止将来有人把文件改名成不符合 "lk*" 约定而意外漏载。
     try:
         from reports import lk01_sample  # noqa: F401
-        # 【新手须知：noqa 注释】
-        #   F401 是"导入了却没使用"的 lint 警告。
-        #   但我们导入它本就是为了"触发注册"，不需要使用它，
-        #   所以用 # noqa: F401 告诉检查工具"这里别报警告"。
-    except ImportError as exc:
-        # logger.debug 级别较低，平时不显示，排查问题时才看
-        logger.debug("lk01_sample 未加载：%s", exc)
+    except Exception as exc:      # noqa: BLE001
+        logger.debug("lk01_sample 未额外加载：%s", exc)
