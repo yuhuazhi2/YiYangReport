@@ -92,14 +92,22 @@ class LK01Report(BaseReport):
         #   而不是逐科目保存 —— 因为模板这一行只呈现合计数。
         #   若将来需要区分"现金/银行存款/其他货币资金"（如 LK04 表），
         #   再另外明细保存。
-        self.monetary_end = 0.0      # 期末余额（me 汇总）→ C11
-        self.monetary_begin = 0.0    # 上年年末余额（mb 汇总）→ D11
+        self.monetary_end = 0.0      # 期末余额（本期 me 汇总）→ C11
+        self.monetary_begin = 0.0    # 上年年末余额（本年1月 mb 汇总）→ D11
         # 【关键标记：本次是否真的取到了数据】
         #   数据库连不上时，若把 0 写进 C11/D11，客户会看到"货币资金 = 0.00"，
         #   误以为公司账上真没钱 —— 这是极危险的信息误读。
         #   所以约定：**没取到数据就不写格子，保持空白**，
         #   并在日志里说明原因。空白 + 日志，比错误的 0 诚实得多。
-        self.has_data = False
+        #
+        # 【为什么分成两个标记？】
+        #   C11 来自本期记录、D11 来自本年1月记录，是两个独立的数据源。
+        #   可能出现"本期有数据、1月记录缺失"的情况（例如中途建账）。
+        #   若共用一个标记，就会把"只缺 D11"误判成"两格都不写"，
+        #   白白丢掉已经取到的 C11。
+        self.has_end_data = False
+        self.has_begin_data = False
+        self.has_data = False        # 兼容旧字段：任一有数据即为 True
 
     # ------------------------------------------------------------------
     # 第1步：取数
@@ -144,36 +152,71 @@ class LK01Report(BaseReport):
             logger.warning("[%s] 货币资金取数失败：%s", self.code, exc)
             rows = []
 
-        # 【汇总】按科目编码逐条累加
+        # 【汇总：必须按 iperiod 分流，不能混在一起加】
+        #
+        # 【这是本项目最容易出错的一处，务必看懂】
+        #   SQL 一次返回两个期间的数据：
+        #     · 本期（iperiod = 当前月）→ 用 me 填 C11
+        #     · 本年1月（iperiod = 1）  → 用 mb 填 D11
+        #
+        #   为什么不能简单地把所有行的 me 相加？
+        #     因为 1 月那条记录也被查回来了，它的 me 是"1月末余额"，
+        #     若混进 C11 就会重复计算。
+        #
+        #   为什么 D11 只取 1 月的 mb？
+        #     现场确认：mb 的语义随月份变化 —— 只有 1 月记录的 mb 是
+        #     "年初余额"；其他月份记录的 mb 是"本月期初"。
+        #     所以 D11 必须专取 1 月那条的 mb，取 5 月的 mb 会得到 4 月末余额。
         self.monetary_end = 0.0
         self.monetary_begin = 0.0
-        detail: list[str] = []
+
+        end_detail: list[str] = []    # 本期明细（供核对 C11 构成）
+        begin_detail: list[str] = []  # 1月明细（供核对 D11 构成）
+        has_end = False               # 是否取到"本期"记录
+        has_begin = False             # 是否取到"本年1月"记录
 
         for row in rows:
             try:
                 # 列顺序由 u8.gl_monetary_funds 的 SELECT 决定：
-                #   第0列 ccode、第1列 mb、第2列 me
+                #   第0列 ccode、第1列 iperiod、第2列 mb、第3列 me
                 ccode = str(row[0]).strip()
-                mb = float(row[1]) if row[1] is not None else 0.0
-                me = float(row[2]) if row[2] is not None else 0.0
+                iperiod = int(row[1])
+                mb = float(row[2]) if row[2] is not None else 0.0
+                me = float(row[3]) if row[3] is not None else 0.0
             except (IndexError, TypeError, ValueError) as exc:
-                # 一条坏数据不应毁掉整张表
                 logger.warning("[%s] 跳过异常记录 %r：%s", self.code, row, exc)
                 continue
 
-            self.monetary_begin += mb
-            self.monetary_end += me
-            detail.append(f"{ccode}(期初{mb:.2f}/期末{me:.2f})")
+            if iperiod == month:
+                # 本期记录 → 期末余额
+                self.monetary_end += me
+                end_detail.append(f"{ccode}={me:.2f}")
+                has_end = True
 
-        # 【是否算"取到了数据"】
-        #   注意：rows 非空即视为取数成功。即使三个科目余额都为 0，
-        #   那也是"查到了、确实为 0"，应当写入 0；
-        #   而 rows 为空才是"没查到/连不上"，此时不写。
-        self.has_data = bool(rows)
+            if iperiod == 1:
+                # 本年1月记录 → 年初余额（即上年年末）
+                self.monetary_begin += mb
+                begin_detail.append(f"{ccode}={mb:.2f}")
+                has_begin = True
 
-        logger.info("[%s] 货币资金取数：%d 条明细 | 期末合计=%.2f，上年年末合计=%.2f | %s",
-                    self.code, len(rows), self.monetary_end, self.monetary_begin,
-                    "、".join(detail) if detail else "(无)")
+            # 【注意：当本期就是 1 月时，上面两个 if 会同时命中同一行。
+            #   这正是我们想要的结果：1 月的 me 是期末、mb 是年初，
+            #   同一行同时提供两个口径，不会重复计算，也不会遗漏。】
+
+        # 【C11 与 D11 分别独立判断是否写】
+        #   两者来自不同期间，可能一个取到一个没取到（例如 1 月记录被删）。
+        #   若共用一个 has_data，会把"只缺 D11"误判成"两个都没有"。
+        self.has_end_data = has_end
+        self.has_begin_data = has_begin
+        self.has_data = has_end or has_begin   # 兼容旧字段
+
+        logger.info(
+            "[%s] 货币资金取数：共 %d 行 | 期末(C11)=%.2f ← [%s] | 年初(D11)=%.2f ← [%s]",
+            self.code, len(rows), self.monetary_end,
+            "、".join(end_detail) if end_detail else "未取到本期记录",
+            self.monetary_begin,
+            "、".join(begin_detail) if begin_detail else "未取到本年1月记录",
+        )
 
     # ------------------------------------------------------------------
     # 第2步：填表
@@ -218,11 +261,20 @@ class LK01Report(BaseReport):
         #
         #   所以约定：**没取到数据就保持空白**，让空白本身成为"未取数"
         #   的信号；同时上面 fetch() 已把原因写进日志，维护者可查。
-        if self.has_data:
+        # 【C11 与 D11 分别独立判断】
+        #   两者数据源不同（本期 me / 本年1月 mb），必须各自判断。
+        #   若共用 has_data，会在"只缺其中一项"时把另一项也丢掉。
+        if self.has_end_data:
             hook.set(self.cell_map["货币资金_期末"], self.monetary_end)
-            hook.set(self.cell_map["货币资金_上年年末"], self.monetary_begin)
-            logger.info("[%s] 已写入 C11=%.2f（期末），D11=%.2f（上年年末）",
-                        self.code, self.monetary_end, self.monetary_begin)
+            logger.info("[%s] 已写入 C11=%.2f（期末余额）",
+                        self.code, self.monetary_end)
         else:
-            logger.warning("[%s] 未取得货币资金数据，C11/D11 保持空白（不写 0）",
+            logger.warning("[%s] 未取得本期记录，C11 保持空白（不写 0）", self.code)
+
+        if self.has_begin_data:
+            hook.set(self.cell_map["货币资金_上年年末"], self.monetary_begin)
+            logger.info("[%s] 已写入 D11=%.2f（上年年末余额，取自本年1月记录）",
+                        self.code, self.monetary_begin)
+        else:
+            logger.warning("[%s] 未取得本年1月记录，D11 保持空白（不写 0）",
                            self.code)

@@ -162,19 +162,31 @@ def gl_monetary_funds(year: int, month: int,
                       ) -> tuple[str, list]:
     """货币资金：按科目集合汇总 GL_accsum 的期末余额(me)与期初余额(mb)。
 
-    【业务口径（来自现场需求）】
+    【业务口径（来自现场需求，20261027 已确认字段语义）】
         LK01 资产负债表第 1 行"货币资金"，取数规则：
-          · 期末余额(C11) = 本期 GL_accsum 中 me 字段的合计
-          · 上年年末余额(D11) = 同期记录中 mb 字段的合计
+          · 期末余额(C11) = 本期记录的 me 字段合计
+          · 上年年末余额(D11) = **本年 1 月记录的 mb 字段合计**
           · 参与汇总的科目：1001(现金) + 1002(银行存款) + 1012(其他货币资金)
 
-    【期间条件怎么定？】
-        现场说明里提到两个字段：
-            iperiod   —— 会计期间（月），如 5
-            iYperiod  —— 年月，如 202605
-        因此这里同时约束两者：既限定月份，也限定"哪一年的这个月"，
-        避免把不同年度的同期数据混进来（U8 年度库虽然一年一库，
-        但按年月双条件过滤是最稳妥的写法）。
+        【⚠ 关键：mb 的语义随月份变化（现场确认）】
+            GL_accsum 里每条记录都带自己的 iperiod：
+              · 当 iperiod = 1（即 iYperiod = xxxx01）时，mb 是"年初余额"
+              · 当 iperiod ≠ 1 时，mb 是"本月期初"（= 上月末余额）
+
+            所以 D11 要的"上年年末余额"，**只能取本年 1 月那条记录的 mb**。
+            若直接取本期（如 5 月）的 mb，拿到的是"5月期初 = 4月末"，
+            那不是上年年末 —— 这才是本函数必须同时查两个期间的根本原因。
+
+    【期间条件：一次查两个期间】
+        需要的数据分布在两个不同的 iperiod 上：
+            本期（如 iperiod=5）    → 取 me 作为 C11
+            本年 1 月（iperiod=1）  → 取 mb 作为 D11
+
+        因此 WHERE 用 OR 连接两组条件，一次查询把两者都取回来。
+        返回的行里带 iperiod，由报表层据此分流，避免混淆。
+
+        好处：少一次数据库往返，且两组数据来自同一快照，
+        不会出现"期末与年初来自不同时刻"的错位。
 
     【iYperiod 的存储格式（现场已确认）】
         现场确认为**整数 int**，如 202605（不是字符串 '202605'，
@@ -190,10 +202,11 @@ def gl_monetary_funds(year: int, month: int,
             既然现场明确是 int，就传 int，让参数类型与字段类型完全一致，
             这是最稳妥、也最不容易出意外的写法。
 
-    【为什么 mb 和 me 一起查？】
-        C11 与 D11 来自同一批记录，只是取的字段不同。
-        一次查询取回两列，既少一次数据库往返，又能保证两格数据同源，
-        不会出现"期末和上年年末来自不同快照"的错位问题。
+    【为什么不直接在 SQL 里 SUM 出两个数？】
+        把明细带回报表层，可以：
+          · 在日志里列出"这个数由哪几个科目构成"，便于与用友前台逐项对账；
+          · 某一科目取数异常时单独跳过，不至于整行结果作废。
+        数据量只有 3 个科目 × 最多 2 个期间 = 最多 6 行，代价可忽略。
 
     【参数 codes】
         默认就是货币资金的三个科目。留成参数是为了将来别处复用
@@ -205,23 +218,31 @@ def gl_monetary_funds(year: int, month: int,
     #
     # 【注意】外层必须加 int()：现场 iYperiod 字段是整数类型，
     #   传整数才能与字段类型严格一致，不依赖数据库做隐式类型转换。
-    yperiod = int(f"{year}{month:02d}")
+    yperiod = int(f"{year}{month:02d}")       # 本期年月，如 202605
+    yperiod_jan = int(f"{year}01")            # 本年 1 月，如 202601
 
     # 科目占位符：有几个科目就生成几个 ?，再交给 params 传值
     placeholders = ", ".join("?" for _ in codes)
 
+    # 【SQL 结构说明】
+    #   外层括号包住整个 OR 条件，再 AND 科目过滤。
+    #   若不加大括号，AND 的优先级会让条件含义完全改变。
+    #   选中 1 月时，两组条件会命中同一批行，但 SQL 不会返回重复行。
     sql = f"""
-        SELECT ccode, mb, me
+        SELECT ccode, iperiod, mb, me
         FROM GL_accsum
-        WHERE iperiod = ?
-          AND iYperiod = ?
+        WHERE (
+                (iYperiod = ? AND iperiod = ?)
+             OR (iYperiod = ? AND iperiod = 1)
+          )
           AND ccode IN ({placeholders})
-        ORDER BY ccode
+        ORDER BY ccode, iperiod
     """
-    # 【新手必学】列表解包：*codes 把元组里的元素逐个放进列表，
-    #   结果形如 [5, 202605, "1001", "1002", "1012"]，
-    #   与 SQL 里 5 个 ? 一一对应，顺序绝不能错。
-    params: list[Any] = [month, yperiod, *codes]
+    # 【新手必学】列表解包：*codes 把元组里的元素逐个放进列表。
+    #   参数顺序必须与 SQL 里 6 个 ? 一一对应：
+    #     ① 本期 yperiod  ② 本期 month  ③ 1月 yperiod
+    #     ④⑤⑥ 三个科目编码
+    params: list[Any] = [yperiod, month, yperiod_jan, *codes]
     return sql, params
 
 
