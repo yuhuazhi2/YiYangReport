@@ -157,6 +157,109 @@ def bank_deposits(year: int, month: int) -> tuple[str, list]:
     """
     return sql, [year, month]
 
+def gl_monetary_funds(year: int, month: int,
+                      codes: tuple[str, ...] = ("1001", "1002", "1012")
+                      ) -> tuple[str, list]:
+    """货币资金：按科目集合汇总 GL_accsum 的期末余额(me)与期初余额(mb)。
+
+    【业务口径（来自现场需求）】
+        LK01 资产负债表第 1 行"货币资金"，取数规则：
+          · 期末余额(C11) = 本期 GL_accsum 中 me 字段的合计
+          · 上年年末余额(D11) = 同期记录中 mb 字段的合计
+          · 参与汇总的科目：1001(现金) + 1002(银行存款) + 1012(其他货币资金)
+
+    【期间条件怎么定？】
+        现场说明里提到两个字段：
+            iperiod   —— 会计期间（月），如 5
+            iYperiod  —— 年月，如 202605
+        因此这里同时约束两者：既限定月份，也限定"哪一年的这个月"，
+        避免把不同年度的同期数据混进来（U8 年度库虽然一年一库，
+        但按年月双条件过滤是最稳妥的写法）。
+
+    【⚠ 需要现场核对的一点】
+        iYperiod 的存储格式在不同版本/不同实施环境可能不一致，
+        常见有三种：202605（整数）、'202605'（字符串）、'2026-05'。
+        本函数按最通用的 **整数 YYYYMM** 处理。
+        若现场实际是别的格式，只需修改本函数里 yperiod 的计算方式一处，
+        报表代码不需要动。
+
+    【为什么 mb 和 me 一起查？】
+        C11 与 D11 来自同一批记录，只是取的字段不同。
+        一次查询取回两列，既少一次数据库往返，又能保证两格数据同源，
+        不会出现"期末和上年年末来自不同快照"的错位问题。
+
+    【参数 codes】
+        默认就是货币资金的三个科目。留成参数是为了将来别处复用
+        （例如"应收账款"也可以用同样的结构汇总 1122 开头的科目）。
+    """
+    # 【新手必学】f"{year}{month:02d}" 把 2026、5 拼成 "202605"
+    #   :02d 表示月份不足两位补 0 —— 若写成 f"{year}{month}"，
+    #   5 月会变成 "20265"，与 202605 完全不是一回事。
+    yperiod = int(f"{year}{month:02d}")
+
+    # 科目占位符：有几个科目就生成几个 ?，再交给 params 传值
+    placeholders = ", ".join("?" for _ in codes)
+
+    sql = f"""
+        SELECT ccode, mb, me
+        FROM GL_accsum
+        WHERE iperiod = ?
+          AND iYperiod = ?
+          AND ccode IN ({placeholders})
+        ORDER BY ccode
+    """
+    # 【新手必学】列表解包：*codes 把元组里的元素逐个放进列表，
+    #   结果形如 [5, 202605, "1001", "1002", "1012"]，
+    #   与 SQL 里 5 个 ? 一一对应，顺序绝不能错。
+    params: list[Any] = [month, yperiod, *codes]
+    return sql, params
+
+
+def gl_period_balance(year: int, month: int,
+                      code_prefixes: tuple[str, ...]) -> tuple[str, list]:
+    """按科目前缀集合汇总某期间的期末余额与期初余额（通用取数）。
+
+    【适用场景】
+        资产负债表里绝大多数行项目都是这个形态：
+            "某几个科目（或某几个前缀）的余额合计"
+        例如：
+            应收账款   → 1122 开头
+            存货       → 1401/1403/1405/1408/1411 等
+            固定资产   → 1601 减 1602
+        与其为每一行都写一个专用函数，不如提供这个通用函数，
+        由报表层传入"这一行涉及哪些科目前缀"。
+
+    【参数 code_prefixes】
+        科目前缀元组，如 ("1122",)。用前缀匹配是为了把明细科目
+        （112201、11220101……）一并纳入汇总 —— 这是财务报表的通行口径。
+
+    【返回】
+        SQL 取回每个科目的 me(期末)、mb(期初)，由报表层自行加总。
+        为什么不在 SQL 里直接 SUM？
+          因为报表可能要按科目分别判断方向（借贷），也需要在日志里
+          说明"这个数由哪几个科目构成"，取明细比取一个总数更有用。
+    """
+    if not code_prefixes:
+        raise ValueError("code_prefixes 不能为空")
+
+    # 【新手必学】条件用 OR 连接多个 LIKE，并整体加括号
+    #   若不加大括号外的括号，AND 的优先级会让条件含义完全改变。
+    like_clause = " OR ".join("ccode LIKE ?" for _ in code_prefixes)
+    yperiod = int(f"{year}{month:02d}")
+
+    sql = f"""
+        SELECT ccode, mb, me
+        FROM GL_accsum
+        WHERE iperiod = ?
+          AND iYperiod = ?
+          AND ({like_clause})
+        ORDER BY ccode
+    """
+    params: list[Any] = [month, yperiod]
+    # 每个前缀后面补 "%"，实现"以此开头"的匹配
+    params.extend(f"{p}%" for p in code_prefixes)
+    return sql, params
+
 
 # ---------------------------------------------------------------------------
 # 三、往来类（应收/应付）
