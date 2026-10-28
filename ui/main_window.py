@@ -306,7 +306,24 @@ class MainWindow(QMainWindow):
         # 等生成成功后再 setEnabled(True) 点亮它（见 _on_finished）。
         self.btn_open_file.setEnabled(False)
         row_tools.addWidget(self.btn_open_file)
+        # addStretch(1) 在这里的作用是"弹簧"：把它左边的东西全推到左边，
+        # 右边的控件（退出按钮）就自然贴到窗口最右侧，实现需求要求的"右下角"。
         row_tools.addStretch(1)
+
+        # ---- 退出按钮（需求：界面右下角放一个退出按钮）----
+        # 【设计要点：为什么不自己写一套退出逻辑，而是调 close()？】
+        #   主窗口已经实现了 closeEvent()，里面处理了两件必须做的事：
+        #     ① 若正在生成报表，先弹窗确认（避免留下损坏的半成品文件、
+        #        或让 Excel 进程残留在后台）；
+        #     ② 退出前保存期间/账套/输出目录等设置（下次启动能恢复）。
+        #   若这里另写一套 os._exit() 或 sys.exit()，就会绕过这两件事：
+        #   正在生成时被强退、设置也丢 —— 属于典型的"两套逻辑走岔"。
+        #   所以按钮只负责"请求关闭窗口"，真正的收尾统一交给 closeEvent。
+        self.btn_exit = QPushButton("退出")
+        self.btn_exit.setToolTip("关闭程序（正在生成时会先征求确认）")
+        self.btn_exit.clicked.connect(self.close)
+        row_tools.addWidget(self.btn_exit)
+
         vres.addLayout(row_tools)
         root.addWidget(gb_result)
 
