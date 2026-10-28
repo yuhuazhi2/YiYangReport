@@ -157,13 +157,19 @@ def bank_deposits(year: int, month: int) -> tuple[str, list]:
     """
     return sql, [year, month]
 
-def gl_monetary_funds(year: int, month: int,
-                      codes: tuple[str, ...] = ("1001", "1002", "1012")
-                      ) -> tuple[str, list]:
-    """货币资金：按科目集合汇总 GL_accsum 的期末余额(me)与期初余额(mb)。
+def gl_balance_by_codes(year: int, month: int,
+                        codes: tuple[str, ...]) -> tuple[str, list]:
+    """按科目集合汇总 GL_accsum 的期末余额(me)与年初余额(mb)（通用取数）。
+
+    【适用场景】
+        LK01 资产负债表里，每一行本质都是"某几个科目的余额合计"：
+            货币资金       → 1001 + 1002
+            交易性金融资产 → 1012（其他货币资金，现场口径归入此行）
+        两者取数逻辑完全相同，只是科目集合不同，因此抽成这个通用函数。
+        后续"应收账款""存货"等行项目只要换一组科目编码即可复用。
 
     【业务口径（来自现场需求，20261027 已确认字段语义）】
-        LK01 资产负债表第 1 行"货币资金"，取数规则：
+        LK01 资产负债表各科目行，取数规则：
           · 期末余额(C11) = 本期记录的 me 字段合计
           · 上年年末余额(D11) = **本年 1 月记录的 mb 字段合计**
           · 参与汇总的科目：1001(现金) + 1002(银行存款) + 1012(其他货币资金)
@@ -209,8 +215,10 @@ def gl_monetary_funds(year: int, month: int,
         数据量只有 3 个科目 × 最多 2 个期间 = 最多 6 行，代价可忽略。
 
     【参数 codes】
-        默认就是货币资金的三个科目。留成参数是为了将来别处复用
-        （例如"应收账款"也可以用同样的结构汇总 1122 开头的科目）。
+        本次要汇总的科目编码元组，由报表层传入。
+        注意用**精确匹配**（IN）而非前缀匹配：
+        科目编码若需包含明细科目，应由调用方显式展开或另用
+        gl_period_balance（按前缀匹配）。二者口径不同，不要混用。
     """
     # 【新手必学】f"{year}{month:02d}" 把 2026、5 拼成 "202605"
     #   :02d 表示月份不足两位补 0 —— 若写成 f"{year}{month}"，
@@ -244,6 +252,25 @@ def gl_monetary_funds(year: int, month: int,
     #     ④⑤⑥ 三个科目编码
     params: list[Any] = [yperiod, month, yperiod_jan, *codes]
     return sql, params
+
+
+def gl_monetary_funds(year: int, month: int,
+                      codes: tuple[str, ...] = ("1001", "1002")
+                      ) -> tuple[str, list]:
+    """货币资金（LK01 第 1 行）：现金 1001 + 银行存款 1002。
+
+    【重要口径变更（20261028 现场确认）】
+        1012「其他货币资金」**不再计入货币资金**，
+        而是归入 LK01 第 2 行「交易性金融资产」核算。
+        因此本函数的默认科目只有 1001、1002。
+
+    【为什么保留这个函数，而不让报表直接调用通用函数？】
+        报表代码里写 gl_monetary_funds(year, month) 比写
+        gl_balance_by_codes(year, month, codes=("1001","1002"))
+        更能自我解释 —— 一眼看出"这是货币资金的口径"。
+        它只是通用函数的一层语义化封装，不包含任何额外逻辑。
+    """
+    return gl_balance_by_codes(year, month, codes)
 
 
 def gl_period_balance(year: int, month: int,
