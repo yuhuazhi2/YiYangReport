@@ -97,25 +97,43 @@ class TestRowValues(unittest.TestCase):
             self.assertTrue(approx(hook.get(spec.end_cell), exp_end))
             self.assertTrue(approx(hook.get(spec.begin_cell), exp_begin))
 
-    def test_fixed_assets_net_of_depreciation(self):
-        """固定资产 = 1601 - 1602（累计折旧）。
+    def test_fixed_assets_net_of_depreciation_and_impairment(self):
+        """固定资产 = 1601 - 1602（累计折旧）- 1603（减值准备）。
 
         【验证点】
-            1. 减法方向正确（若误加成 1601+1602，结果会偏大）；
-            2. 累计折旧无记录时仍写 1601（不能因缺减项而空白）。
+            1. 两个减项都生效（若漏掉 1603，结果会比正确值偏大）；
+            2. 减法方向正确（若误加，结果会更大）；
+            3. 这是本表第一个"多项减项"的行，验证 exclude_codes
+               支持多个科目。
         """
         rows = make_rows({
             "1601": (100000.0, 120000.0),   # 固定资产原值
             "1602": (30000.0, 40000.0),     # 累计折旧
+            "1603": (5000.0, 8000.0),       # 减值准备
         }, month=5)
         hook, _ = run_report(rows, month=5)
 
-        # 期末 = 120000 - 40000 = 80000
-        self.assertTrue(approx(hook.get("C47"), 80000.0),
-                        f"固定资产期末应为 80000,实际 {hook.get('C47')}")
-        # 年初 = 100000 - 30000 = 70000
-        self.assertTrue(approx(hook.get("D47"), 70000.0),
-                        f"固定资产年初应为 70000,实际 {hook.get('D47')}")
+        # 期末 = 120000 - 40000 - 8000 = 72000
+        self.assertTrue(approx(hook.get("C47"), 72000.0),
+                        f"固定资产期末应为 72000,实际 {hook.get('C47')}")
+        # 年初 = 100000 - 30000 - 5000 = 65000
+        self.assertTrue(approx(hook.get("D47"), 65000.0),
+                        f"固定资产年初应为 65000,实际 {hook.get('D47')}")
+
+    def test_fixed_assets_without_impairment(self):
+        """减值准备无记录时,固定资产 = 1601 - 1602（不能空白）。
+
+        【边界情形】很多企业并未计提减值准备，1603 当期无记录是正常的。
+        此时减项贡献 0，C47 应等于 1601-1602，不能因此不写。
+        """
+        rows = make_rows({
+            "1601": (100000.0, 120000.0),
+            "1602": (30000.0, 40000.0),
+        }, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        self.assertTrue(approx(hook.get("C47"), 80000.0))
+        self.assertTrue(approx(hook.get("D47"), 70000.0))
 
     def test_three_deduction_codes_not_crossed(self):
         """三个减项科目各归各行,互不串用。
@@ -134,6 +152,7 @@ class TestRowValues(unittest.TestCase):
             "123102": (200.0, 350.0),
             "1601": (100000.0, 120000.0),
             "1602": (30000.0, 40000.0),
+            "1603": (5000.0, 8000.0),
         }, month=5)
         hook, _ = run_report(rows, month=5)
 
@@ -141,8 +160,9 @@ class TestRowValues(unittest.TestCase):
         self.assertTrue(approx(hook.get("D17"), 9000.0))
         self.assertTrue(approx(hook.get("C21"), 5650.0))
         self.assertTrue(approx(hook.get("D21"), 4800.0))
-        self.assertTrue(approx(hook.get("C47"), 80000.0))
-        self.assertTrue(approx(hook.get("D47"), 70000.0))
+        # 固定资产 = 120000-40000-8000 / 100000-30000-5000
+        self.assertTrue(approx(hook.get("C47"), 72000.0))
+        self.assertTrue(approx(hook.get("D47"), 65000.0))
 
     def test_other_receivable_is_net_of_its_own_bad_debt(self):
         """其他应收款 = 1221 - 123102（注意不是 123101）。
