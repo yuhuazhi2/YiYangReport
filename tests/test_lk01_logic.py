@@ -97,6 +97,41 @@ class TestRowValues(unittest.TestCase):
             self.assertTrue(approx(hook.get(spec.end_cell), exp_end))
             self.assertTrue(approx(hook.get(spec.begin_cell), exp_begin))
 
+    def test_intangible_assets_net(self):
+        """无形资产 = 1701 - 1702（累计摊销）- 1703（减值准备）。
+
+        【验证点】
+            1. 两个减项都生效（若漏掉 1703，结果会偏大）；
+            2. 与固定资产不同，本行**没有加项**，若误把 1702/1703
+               当加项，结果会明显偏大；
+            3. 累计摊销无记录、减值准备无记录时都应正常写入。
+        """
+        rows = make_rows({
+            "1701": (50000.0, 60000.0),    # 无形资产原值
+            "1702": (10000.0, 15000.0),    # 累计摊销
+            "1703": (2000.0, 3000.0),      # 减值准备
+        }, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        # 期末 = 60000 - 15000 - 3000 = 42000
+        self.assertTrue(approx(hook.get("C55"), 42000.0),
+                        f"无形资产期末应为 42000,实际 {hook.get('C55')}")
+        # 年初 = 50000 - 10000 - 2000 = 38000
+        self.assertTrue(approx(hook.get("D55"), 38000.0),
+                        f"无形资产年初应为 38000,实际 {hook.get('D55')}")
+
+    def test_intangible_assets_without_deductions(self):
+        """累计摊销/减值准备都无记录时,无形资产 = 1701 本身（不能空白）。
+
+        【边界情形】新建账套或尚未开始摊销时，1702/1703 可能无记录。
+        此时减项贡献 0，C55 应等于 1701，不能因此不写。
+        """
+        rows = make_rows({"1701": (50000.0, 60000.0)}, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        self.assertTrue(approx(hook.get("C55"), 60000.0))
+        self.assertTrue(approx(hook.get("D55"), 50000.0))
+
     def test_fixed_assets_full_formula(self):
         """固定资产 = 1601 + 1606（清理）- 1602（折旧）- 1603（减值）。
 
