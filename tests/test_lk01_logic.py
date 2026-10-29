@@ -107,6 +107,31 @@ class TestRowValues(unittest.TestCase):
         self.assertTrue(approx(hook.get("C13"), 9000.0))
         self.assertTrue(approx(hook.get("D13"), 9000.0))
 
+    def test_inventory_sums_four_codes(self):
+        """存货 = 1401 + 1403 + 1405 + 1408 四科目汇总。
+
+        【为什么要单独测这一行？】
+            存货是当前唯一"由 4 个科目组成"的行（其他行最多 2 个）。
+            多科目汇总最容易出的问题是"漏掉其中一个"或"多加了别的",
+            而报表上只会显示一个合计数,肉眼很难发现少了哪一项。
+        """
+        rows = make_rows({
+            "1401": (100.0, 200.0),    # 材料采购
+            "1403": (300.0, 400.0),    # 原材料
+            "1405": (500.0, 600.0),    # 库存商品
+            "1408": (700.0, 800.0),    # 委托加工物资
+            # 下面这个不在存货范围内,用于确认不会被误加进来
+            "1402": (9999.0, 9999.0),
+        }, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        # 期末 = 200+400+600+800 = 2000
+        self.assertTrue(approx(hook.get("C23"), 2000.0),
+                        f"存货期末应为 2000,实际 {hook.get('C23')}")
+        # 年初 = 100+300+500+700 = 1600
+        self.assertTrue(approx(hook.get("D23"), 1600.0),
+                        f"存货年初应为 1600,实际 {hook.get('D23')}")
+
     def test_no_data_writes_nothing(self):
         """无任何记录时,所有金额格保持空白（不写 0）。"""
         hook, _ = run_report([], month=5)
