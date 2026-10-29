@@ -34,7 +34,11 @@ if str(_ROOT) not in sys.path:
 
 from tests.fakes import FakeCtx, FakeHook, approx, make_rows  # noqa: E402
 
-from reports.lk01_sample import ROW_SPECS, LK01Report     # noqa: E402
+from reports.lk01_sample import (                          # noqa: E402
+    PENDING_ROWS,
+    ROW_SPECS,
+    LK01Report,
+)
 
 
 def run_report(rows=None, month=5, fail=False):
@@ -218,6 +222,38 @@ class TestConfigConsistency(unittest.TestCase):
                     cell, seen,
                     f"格子 {cell} 被 {seen.get(cell)} 和 {spec.key} 同时使用")
                 seen[cell] = spec.key
+
+    def test_pending_rows_not_conflict(self):
+        """待定项不得与已实现项占用同一格子。
+
+        【为什么需要这条？】
+            PENDING_ROWS 记录的是"口径未明确、暂不实现"的行。
+            将来补实现时，若不小心与已有行撞格子，后写的会覆盖前写的，
+            而报表上看不出异常（数字还在，只是属于别的项目）。
+            这条在冲突发生的**当下**就报错，比事后查账便宜得多。
+        """
+        implemented = set()
+        for spec in ROW_SPECS:
+            implemented.add(spec.end_cell)
+            implemented.add(spec.begin_cell)
+
+        for name, cells, row_no in PENDING_ROWS:
+            # cells 形如 "C19/D19"，拆成两个地址
+            for cell in cells.split("/"):
+                self.assertNotIn(
+                    cell, implemented,
+                    f"待定项「{name}」的 {cell} 与已实现行冲突"
+                    f"（行次 {row_no}）")
+
+    def test_pending_rows_unique(self):
+        """待定项之间也不得重复（同一格被两个待定项占用）。"""
+        seen: dict[str, str] = {}
+        for name, cells, _ in PENDING_ROWS:
+            for cell in cells.split("/"):
+                self.assertNotIn(
+                    cell, seen,
+                    f"待定项 {cell} 被「{seen.get(cell)}」和「{name}」同时占用")
+                seen[cell] = name
 
     def test_codes_are_strings(self):
         """科目编码必须是字符串 —— 若是数字,1001 会变成 '1001' 之外的形式。"""
