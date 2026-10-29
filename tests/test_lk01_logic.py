@@ -37,6 +37,8 @@ from tests.fakes import FakeCtx, FakeHook, approx, make_rows  # noqa: E402
 from reports.lk01_sample import (                          # noqa: E402
     PENDING_ROWS,
     ROW_SPECS,
+    SUM_EXCLUDED_ROWS,
+    SUM_ROWS_TODO,
     LK01Report,
 )
 
@@ -484,6 +486,43 @@ class TestConfigConsistency(unittest.TestCase):
                     cell, seen,
                     f"待定项 {cell} 被「{seen.get(cell)}」和「{name}」同时占用")
                 seen[cell] = name
+
+    def test_summary_excluded_rows_not_implemented(self):
+        """汇总时须排除的行（如"其中：固定资产清理"）不得被实现为独立行。
+
+        【为什么需要这条？】
+            第 49 行"其中：固定资产清理"是第 47 行固定资产的补充说明，
+            其金额已通过科目 1606 计入 C47。若有人把它当成独立行加进
+            ROW_SPECS，就会在"非流动资产合计"里**重复计算**一次
+            —— 金额偏大，且从报表上完全看不出问题。
+
+            本条在冲突发生的当下就报错。
+        """
+        implemented_cells = set()
+        for spec in ROW_SPECS:
+            implemented_cells.add(spec.end_cell)
+            implemented_cells.add(spec.begin_cell)
+
+        for row_no, name in SUM_EXCLUDED_ROWS:
+            for col in ("C", "D"):
+                cell = f"{col}{row_no}"
+                self.assertNotIn(
+                    cell, implemented_cells,
+                    f"「{name}」({cell}) 是汇总时须排除的明细行，"
+                    f"不应被实现为 ROW_SPECS 中的独立行，否则会重复计算")
+
+    def test_summary_todo_not_conflict(self):
+        """待实现汇总行的格位,不得与现有已实现行冲突。"""
+        implemented_cells = set()
+        for spec in ROW_SPECS:
+            implemented_cells.add(spec.end_cell)
+            implemented_cells.add(spec.begin_cell)
+
+        for row_no, name, cells in SUM_ROWS_TODO:
+            for cell in cells.split("/"):
+                self.assertNotIn(
+                    cell, implemented_cells,
+                    f"待实现汇总行「{name}」的 {cell} 与现有行冲突")
 
     def test_codes_are_strings(self):
         """科目编码必须是字符串 —— 若是数字,1001 会变成 '1001' 之外的形式。"""
