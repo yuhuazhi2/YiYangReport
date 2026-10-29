@@ -97,6 +97,69 @@ class TestRowValues(unittest.TestCase):
             self.assertTrue(approx(hook.get(spec.end_cell), exp_end))
             self.assertTrue(approx(hook.get(spec.begin_cell), exp_begin))
 
+    def test_receivable_is_net_of_bad_debt(self):
+        """应收账款 = 1122 - 123101（坏账准备）。
+
+        【为什么要专门测？】
+            这是本表第一行"减法"口径。加法的错相对容易看出来
+            （数字偏大）；减法的错更隐蔽——若把减项也当成加项，
+            结果会变成"1122 + 坏账准备"，比正确值还大，但报表上
+            只是个合计数，看不出方向。
+        """
+        rows = make_rows({
+            "1122": (10000.0, 12000.0),    # 应收账款
+            "123101": (500.0, 800.0),      # 坏账准备
+        }, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        # 期末 = 12000 - 800 = 11200
+        self.assertTrue(approx(hook.get("C17"), 11200.0),
+                        f"应收账款期末应为 11200,实际 {hook.get('C17')}")
+        # 年初 = 10000 - 500 = 9500
+        self.assertTrue(approx(hook.get("D17"), 9500.0),
+                        f"应收账款年初应为 9500,实际 {hook.get('D17')}")
+
+    def test_receivable_without_bad_debt(self):
+        """坏账准备无记录时,应收账款 = 1122 本身（不因缺减项而不写）。
+
+        【边界情形】坏账准备科目当期无余额是正常的。
+        此时减项贡献 0，加项仍在，C17 应等于 1122 的金额，不能空白。
+        """
+        rows = make_rows({"1122": (1000.0, 1500.0)}, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        self.assertTrue(approx(hook.get("C17"), 1500.0))
+        self.assertTrue(approx(hook.get("D17"), 1000.0))
+
+    def test_receivable_only_bad_debt_skipped(self):
+        """只有坏账准备、没有 1122 记录时,不写负数。
+
+        【为什么不写？】
+            数据异常（或科目设错）时若照算，C17 会变成 -800 这种
+            不可能出现的值。宁可留空让维护者查，也不能写一个
+            看起来像"负资产"的数。
+        """
+        rows = make_rows({"123101": (500.0, 800.0)}, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        self.assertIsNone(hook.get("C17"),
+                          f"不应写入负数,实际 {hook.get('C17')}")
+        self.assertIsNone(hook.get("D17"))
+
+    def test_other_rows_unchanged_by_exclude_support(self):
+        """引入减项能力后,其他行的加法口径不受影响。"""
+        codes = {c: (100.0, 200.0) for c in
+                 sorted({c for s in ROW_SPECS for c in (*s.codes, *s.exclude_codes)})}
+        rows = make_rows(codes, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        for spec in ROW_SPECS:
+            exp_end = (sum(codes[c][1] for c in spec.codes)
+                       - sum(codes[c][1] for c in spec.exclude_codes))
+            self.assertTrue(
+                approx(hook.get(spec.end_cell), exp_end),
+                f"{spec.key} 期末期望 {exp_end},实际 {hook.get(spec.end_cell)}")
+
     def test_money_fund_excludes_1012(self):
         """货币资金必须排除 1012（1012 归入交易性金融资产）。"""
         rows = make_rows({"1001": (100.0, 200.0),

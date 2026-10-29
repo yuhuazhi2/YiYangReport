@@ -14,7 +14,7 @@ LK01 资产负债表
     │  1   │ 货币资金           │ 1001 + 1002    │  C11    │  D11    │
     │  2   │ 交易性金融资产     │ 1012           │  C13    │  D13    │
     │  3   │ 应收票据           │ 1121           │  C15    │  D15    │
-    │  4   │ 应收账款           │ 1122           │  C17    │  D17    │
+    │  4   │ 应收账款(净额)     │ 1122-123101    │  C17    │  D17    │
     │  6   │ 其他应收款         │ 1221           │  C21    │  D21    │
     │  7   │ 存货               │ 1401+1403      │  C23    │  D23    │
     │      │                    │ +1405+1408     │         │         │
@@ -73,15 +73,27 @@ class BalanceRow:
           · 不会因为复制粘贴而漏改某个格子地址。
 
     字段：
-        key        内部标识（用于日志与调试）
-        label      财务名称（写日志用，建议与模板行项目名一致）
-        codes      参与汇总的科目编码（精确匹配）
-        end_cell   期末余额单元格（如 "C11"）
-        begin_cell 上年年末余额单元格（如 "D11"）
+        key          内部标识（用于日志与调试）
+        label        财务名称（写日志用，建议与模板行项目名一致）
+        codes        参与汇总的科目编码（**加项**，精确匹配）
+        end_cell     期末余额单元格（如 "C11"）
+        begin_cell   上年年末余额单元格（如 "D11"）
+        exclude_codes **减项**科目编码（默认空）
 
         【注意】codes 是"精确匹配"。若某行需要包含明细科目
         （如应收账款 1122 及其下级 112201…），应改用前缀匹配的
         取数函数，不能在这里直接写 "1122"。
+
+        【exclude_codes 是为什么加的？】
+            资产负债表里有"净额列示"的行，最典型的是应收账款：
+                应收账款(净) = 应收账款余额 - 坏账准备
+            即需求第 6 条调整后的口径：1122 - 123101。
+            若只提供加法，这类行就没法表达，只能退回到"给这张表
+            写专用逻辑"——那会破坏"新增一行只加配置"的原则。
+
+            所以这里加一个减项集合：
+                最终值 = sum(codes) - sum(exclude_codes)
+            默认空元组，对前面 7 行没有任何影响。
     """
 
     key: str
@@ -89,6 +101,7 @@ class BalanceRow:
     codes: tuple[str, ...]
     end_cell: str
     begin_cell: str
+    exclude_codes: tuple[str, ...] = ()
 
 
 # =====================================================================
@@ -122,12 +135,23 @@ ROW_SPECS: tuple[BalanceRow, ...] = (
     ),
     BalanceRow(
         key="应收账款",
-        label="应收账款",
-        # 【需求 20261028 第 6 条】科目 1122
+        label="应收账款（净额，已扣坏账准备）",
         # 模板第 17 行 A17="  应收账款"，行次 4
-        # 【口径】现场确认采用**精确匹配**：只取编码恰为 1122 的记录，
-        #   不含 112201 等下级科目（与前几行保持一致）。
+        #
+        # 【需求 20261028 第 6 条 → 20261029 调整】
+        #   原口径：只取 1122 本身。
+        #   调整后：应收账款按**净额**列示，需扣除坏账准备：
+        #       C17 = 1122 月末数 - 123101 月末数
+        #       D17 = 1122 年初数 - 123101 年初数
+        #
+        # 【为什么 label 要写"净额，已扣坏账准备"？】
+        #   报表上只显示一个合计数。日后若核对发现 C17 与用友前台
+        #   "应收账款"余额不一致，看到这个 label 就能立刻想到
+        #   "差的那部分是不是坏账准备"，不必翻代码。
+        #
+        # 【口径】仍为精确匹配（不含 112201 等下级）。
         codes=("1122",),
+        exclude_codes=("123101",),
         end_cell="C17",
         begin_cell="D17",
     ),
@@ -272,8 +296,14 @@ class LK01Report(BaseReport):
         """
         year, month = ctx.period.year, ctx.period.month
 
-        # 汇总所有行用到的科目（去重 + 排序，保证缓存键稳定）
-        all_codes = tuple(sorted({c for spec in ROW_SPECS for c in spec.codes}))
+        # 汇总所有行用到的科目（**含减项**，去重 + 排序，保证缓存键稳定）
+        # 【为什么要带上 exclude_codes？】
+        #   减项科目（如坏账准备 123101）也必须查回来，否则减不掉。
+        all_codes = tuple(sorted({
+            c
+            for spec in ROW_SPECS
+            for c in (*spec.codes, *spec.exclude_codes)
+        }))
 
         # 【缓存键】必须带上科目集合，否则将来加行项目时会撞键
         key = ctx.make_key("GL_accsum", "LK01资产行", *all_codes)
@@ -295,11 +325,15 @@ class LK01Report(BaseReport):
         det_end: dict[str, list[str]] = {spec.key: [] for spec in ROW_SPECS}
         det_begin: dict[str, list[str]] = {spec.key: [] for spec in ROW_SPECS}
 
-        # 科目 → 所属行（一个科目可能属于多行，故用 list）
-        code_to_rows: dict[str, list[BalanceRow]] = {}
+        # 科目 → [(所属行, 符号)]
+        #   符号 +1 = 加项（codes），-1 = 减项（exclude_codes）
+        #   一个科目可能同时被多行使用，故用 list。
+        code_to_rows: dict[str, list[tuple[BalanceRow, int]]] = {}
         for spec in ROW_SPECS:
             for c in spec.codes:
-                code_to_rows.setdefault(c, []).append(spec)
+                code_to_rows.setdefault(c, []).append((spec, +1))
+            for c in spec.exclude_codes:
+                code_to_rows.setdefault(c, []).append((spec, -1))
 
         # ---- 逐条分流累加 ----
         for row in rows:
@@ -318,18 +352,29 @@ class LK01Report(BaseReport):
             if not specs:
                 continue
 
-            for spec in specs:
+            for spec, sign in specs:
+                # 【关键：has_xxx 只由"加项"决定】
+                #   若某行只有减项科目有记录、加项科目没有（数据异常），
+                #   累加结果会是负数。此时 has_end 仍为 False，
+                #   该格不会被写入 —— 宁可不写，也不写一个负数误导人。
+                if sign > 0:
+                    mark = "+"
+                else:
+                    mark = "-"
+
                 if iperiod == month:
                     # 本期记录 → 期末余额
-                    acc_end[spec.key] += me
-                    has_end[spec.key] = True
-                    det_end[spec.key].append(f"{ccode}={me:.2f}")
+                    acc_end[spec.key] += sign * me
+                    if sign > 0:
+                        has_end[spec.key] = True
+                    det_end[spec.key].append(f"{mark}{ccode}={me:.2f}")
 
                 if iperiod == 1:
                     # 本年1月记录 → 年初余额（上年年末）
-                    acc_begin[spec.key] += mb
-                    has_begin[spec.key] = True
-                    det_begin[spec.key].append(f"{ccode}={mb:.2f}")
+                    acc_begin[spec.key] += sign * mb
+                    if sign > 0:
+                        has_begin[spec.key] = True
+                    det_begin[spec.key].append(f"{mark}{ccode}={mb:.2f}")
 
                 # 【本期恰为1月时，同一行会同时命中上面两个分支：
                 #   me 作期末、mb 作年初，互不干扰，也不会重复计算。】
