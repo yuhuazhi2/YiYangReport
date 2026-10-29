@@ -134,6 +134,33 @@ class TestRowValues(unittest.TestCase):
         self.assertTrue(approx(hook.get("C55"), 60000.0))
         self.assertTrue(approx(hook.get("D55"), 50000.0))
 
+    def test_1606_goes_to_both_rows(self):
+        """1606 同时写入 C47（参与合计）与 C49（明细，不参与合计）。
+
+        【为什么要单独测？】
+            一个科目归属两行是本表首次出现的情况，容易被误认为
+            "只能归属一行"。若 fetch() 的科目映射写成单值字典，
+            后写的一行会覆盖前一行，导致其中一行为空。
+
+            本表用 "科目 → [(行, 符号)]" 的多值映射，
+            本条就是验证这个设计确实生效。
+        """
+        rows = make_rows({
+            "1601": (100000.0, 120000.0),
+            "1606": (2000.0, 3000.0),
+            "1602": (30000.0, 40000.0),
+            "1603": (5000.0, 8000.0),
+        }, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        # C47 = 120000 + 3000 - 40000 - 8000 = 75000（含 1606）
+        self.assertTrue(approx(hook.get("C47"), 75000.0))
+        self.assertTrue(approx(hook.get("D47"), 67000.0))
+        # C49 = 1606 本身 = 3000（仅明细，不重复计入合计）
+        self.assertTrue(approx(hook.get("C49"), 3000.0),
+                        f"C49 应等于 1606 本身 3000,实际 {hook.get('C49')}")
+        self.assertTrue(approx(hook.get("D49"), 2000.0))
+
     def test_fixed_assets_full_formula(self):
         """固定资产 = 1601 + 1606（清理）- 1602（折旧）- 1603（减值）。
 
@@ -487,29 +514,51 @@ class TestConfigConsistency(unittest.TestCase):
                     f"待定项 {cell} 被「{seen.get(cell)}」和「{name}」同时占用")
                 seen[cell] = name
 
-    def test_summary_excluded_rows_not_implemented(self):
-        """汇总时须排除的行（如"其中：固定资产清理"）不得被实现为独立行。
+    def test_summary_excluded_rows_have_in_subtotal_false(self):
+        """汇总时须排除的行，若已实现则必须 in_subtotal=False。
 
-        【为什么需要这条？】
-            第 49 行"其中：固定资产清理"是第 47 行固定资产的补充说明，
-            其金额已通过科目 1606 计入 C47。若有人把它当成独立行加进
-            ROW_SPECS，就会在"非流动资产合计"里**重复计算**一次
-            —— 金额偏大，且从报表上完全看不出问题。
+        【这条测试的口径与实现方式都变过一次，值得记录】
 
-            本条在冲突发生的当下就报错。
+          第 1 版（错误）：
+            用"该行不得出现在 ROW_SPECS"来防止重复计算。
+            问题：等于连"填数"也禁止了，但客户其实需要看到
+            C49「其中：固定资产清理」的明细金额。
+
+          第 2 版（当前）：
+            允许该行存在于 ROW_SPECS（正常填数），
+            但必须 in_subtotal=False（不参与合计）。
+            本测试守住这条约束。
+
+        【为什么重复计算很难发现？】
+            第 49 行的 1606 已经计入 C47。若汇总时再加一次 C49，
+            非流动资产合计会偏大恰好一个 1606 的金额，
+            而报表上每个单元格看起来都"很正常"。
         """
-        implemented_cells = set()
-        for spec in ROW_SPECS:
-            implemented_cells.add(spec.end_cell)
-            implemented_cells.add(spec.begin_cell)
+        excluded_row_nos = {row_no for row_no, _ in SUM_EXCLUDED_ROWS}
 
-        for row_no, name in SUM_EXCLUDED_ROWS:
-            for col in ("C", "D"):
-                cell = f"{col}{row_no}"
-                self.assertNotIn(
-                    cell, implemented_cells,
-                    f"「{name}」({cell}) 是汇总时须排除的明细行，"
-                    f"不应被实现为 ROW_SPECS 中的独立行，否则会重复计算")
+        for spec in ROW_SPECS:
+            # 从格位里取行号（如 "C49" → 49）
+            row_no = int("".join(ch for ch in spec.end_cell if ch.isdigit()))
+            if row_no in excluded_row_nos:
+                self.assertFalse(
+                    spec.in_subtotal,
+                    f"「{spec.label}」对应第 {row_no} 行，属汇总须排除的明细行，"
+                    f"应设 in_subtotal=False，否则合计会重复计算")
+
+    def test_all_other_rows_in_subtotal(self):
+        """除排除清单外，其余行都应参与汇总（in_subtotal=True）。
+
+        防止有人为了"先让它不出数"而随手把某行设成 False，
+        导致合计静默变少。
+        """
+        excluded_row_nos = {row_no for row_no, _ in SUM_EXCLUDED_ROWS}
+        for spec in ROW_SPECS:
+            row_no = int("".join(ch for ch in spec.end_cell if ch.isdigit()))
+            if row_no not in excluded_row_nos:
+                self.assertTrue(
+                    spec.in_subtotal,
+                    f"「{spec.label}」({spec.end_cell}) 应参与汇总，"
+                    f"却被设为 in_subtotal=False")
 
     def test_summary_todo_not_conflict(self):
         """待实现汇总行的格位,不得与现有已实现行冲突。"""
