@@ -97,6 +97,52 @@ class TestRowValues(unittest.TestCase):
             self.assertTrue(approx(hook.get(spec.end_cell), exp_end))
             self.assertTrue(approx(hook.get(spec.begin_cell), exp_begin))
 
+    def test_other_receivable_is_net_of_its_own_bad_debt(self):
+        """其他应收款 = 1221 - 123102（注意不是 123101）。
+
+        【为什么这条测试特别重要？】
+            应收账款用 123101、其他应收款用 123102，两个科目编码
+            只差最后一位，肉眼极易看错。若写错，报表仍会输出一个
+            貌似合理的数字（因为两笔坏账准备金额通常不等，但都正常），
+            只有拿计算器逐笔核对才能发现。
+        """
+        rows = make_rows({
+            "1221": (5000.0, 6000.0),      # 其他应收款
+            "123102": (200.0, 350.0),      # 其他应收款的坏账准备
+            "123101": (9999.0, 9999.0),    # 应收账款的坏账准备，不应参与本行
+        }, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        # 期末 = 6000 - 350 = 5650
+        self.assertTrue(approx(hook.get("C21"), 5650.0),
+                        f"其他应收款期末应为 5650,实际 {hook.get('C21')}")
+        # 年初 = 5000 - 200 = 4800
+        self.assertTrue(approx(hook.get("D21"), 4800.0),
+                        f"其他应收款年初应为 4800,实际 {hook.get('D21')}")
+
+    def test_two_bad_debts_not_crossed(self):
+        """两组坏账准备各归各行,互不串用。
+
+        同时给应收账款与其他应收款数据，验证：
+            应收票据/应收账款 用 123101
+            其他应收款        用 123102
+        若两行错用了对方的减项，本条会失败。
+        """
+        rows = make_rows({
+            "1122": (10000.0, 12000.0),
+            "123101": (1000.0, 2000.0),
+            "1221": (5000.0, 6000.0),
+            "123102": (200.0, 350.0),
+        }, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        # 应收账款 = 12000-2000 / 10000-1000
+        self.assertTrue(approx(hook.get("C17"), 10000.0))
+        self.assertTrue(approx(hook.get("D17"), 9000.0))
+        # 其他应收款 = 6000-350 / 5000-200
+        self.assertTrue(approx(hook.get("C21"), 5650.0))
+        self.assertTrue(approx(hook.get("D21"), 4800.0))
+
     def test_receivable_is_net_of_bad_debt(self):
         """应收账款 = 1122 - 123101（坏账准备）。
 
