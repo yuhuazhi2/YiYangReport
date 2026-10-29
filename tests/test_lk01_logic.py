@@ -97,28 +97,46 @@ class TestRowValues(unittest.TestCase):
             self.assertTrue(approx(hook.get(spec.end_cell), exp_end))
             self.assertTrue(approx(hook.get(spec.begin_cell), exp_begin))
 
-    def test_fixed_assets_net_of_depreciation_and_impairment(self):
-        """固定资产 = 1601 - 1602（累计折旧）- 1603（减值准备）。
+    def test_fixed_assets_full_formula(self):
+        """固定资产 = 1601 + 1606（清理）- 1602（折旧）- 1603（减值）。
 
         【验证点】
-            1. 两个减项都生效（若漏掉 1603，结果会比正确值偏大）；
-            2. 减法方向正确（若误加，结果会更大）；
-            3. 这是本表第一个"多项减项"的行，验证 exclude_codes
-               支持多个科目。
+            1. 加项 1606 生效（若漏掉，结果会偏小）；
+            2. 两个减项都生效（若漏掉，结果会偏大）；
+            3. 加减方向正确（若把 1606 当成减项、或把 1602 当成加项，
+               结果会明显偏离）；
+            4. 这是本表第一个"同时含多个加项与多个减项"的行。
         """
         rows = make_rows({
             "1601": (100000.0, 120000.0),   # 固定资产原值
-            "1602": (30000.0, 40000.0),     # 累计折旧
-            "1603": (5000.0, 8000.0),       # 减值准备
+            "1606": (2000.0, 3000.0),       # 固定资产清理（加项）
+            "1602": (30000.0, 40000.0),     # 累计折旧（减项）
+            "1603": (5000.0, 8000.0),       # 减值准备（减项）
         }, month=5)
         hook, _ = run_report(rows, month=5)
 
-        # 期末 = 120000 - 40000 - 8000 = 72000
-        self.assertTrue(approx(hook.get("C47"), 72000.0),
-                        f"固定资产期末应为 72000,实际 {hook.get('C47')}")
-        # 年初 = 100000 - 30000 - 5000 = 65000
-        self.assertTrue(approx(hook.get("D47"), 65000.0),
-                        f"固定资产年初应为 65000,实际 {hook.get('D47')}")
+        # 期末 = 120000 + 3000 - 40000 - 8000 = 75000
+        self.assertTrue(approx(hook.get("C47"), 75000.0),
+                        f"固定资产期末应为 75000,实际 {hook.get('C47')}")
+        # 年初 = 100000 + 2000 - 30000 - 5000 = 67000
+        self.assertTrue(approx(hook.get("D47"), 67000.0),
+                        f"固定资产年初应为 67000,实际 {hook.get('D47')}")
+
+    def test_fixed_assets_without_cleanup(self):
+        """1606 固定资产清理无记录时,固定资产 = 1601 - 1602 - 1603。
+
+        【边界情形】固定资产清理有余额才正常，无余额很常见
+        （清理完毕或从未发生）。此时加项贡献 0，仍应正常写入。
+        """
+        rows = make_rows({
+            "1601": (100000.0, 120000.0),
+            "1602": (30000.0, 40000.0),
+            "1603": (5000.0, 8000.0),
+        }, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        self.assertTrue(approx(hook.get("C47"), 72000.0))
+        self.assertTrue(approx(hook.get("D47"), 65000.0))
 
     def test_fixed_assets_without_impairment(self):
         """减值准备无记录时,固定资产 = 1601 - 1602（不能空白）。
@@ -151,6 +169,7 @@ class TestRowValues(unittest.TestCase):
             "1221": (5000.0, 6000.0),
             "123102": (200.0, 350.0),
             "1601": (100000.0, 120000.0),
+            "1606": (2000.0, 3000.0),
             "1602": (30000.0, 40000.0),
             "1603": (5000.0, 8000.0),
         }, month=5)
@@ -160,9 +179,9 @@ class TestRowValues(unittest.TestCase):
         self.assertTrue(approx(hook.get("D17"), 9000.0))
         self.assertTrue(approx(hook.get("C21"), 5650.0))
         self.assertTrue(approx(hook.get("D21"), 4800.0))
-        # 固定资产 = 120000-40000-8000 / 100000-30000-5000
-        self.assertTrue(approx(hook.get("C47"), 72000.0))
-        self.assertTrue(approx(hook.get("D47"), 65000.0))
+        # 固定资产 = 120000+3000-40000-8000 / 100000+2000-30000-5000
+        self.assertTrue(approx(hook.get("C47"), 75000.0))
+        self.assertTrue(approx(hook.get("D47"), 67000.0))
 
     def test_other_receivable_is_net_of_its_own_bad_debt(self):
         """其他应收款 = 1221 - 123102（注意不是 123101）。
