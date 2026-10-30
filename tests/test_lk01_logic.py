@@ -99,6 +99,38 @@ class TestRowValues(unittest.TestCase):
             self.assertTrue(approx(hook.get(spec.end_cell), exp_end))
             self.assertTrue(approx(hook.get(spec.begin_cell), exp_begin))
 
+    def test_other_payables_sums_three_codes(self):
+        """其他应付款 = 2241 + 2231（应付利息）+ 2232（应付股利）。
+
+        【为什么要单独测？】
+            "应付利息""应付股利"在 U8 里是独立科目，但在资产负债表中
+            并入"其他应付款"项目列示。若漏掉其中任一个，报表上只会
+            显示一个偏小的合计数，肉眼完全看不出少了什么。
+        """
+        rows = make_rows({
+            "2241": (1000.0, 2000.0),    # 其他应付款
+            "2231": (300.0, 400.0),      # 应付利息
+            "2232": (500.0, 600.0),      # 应付股利
+            # 下面这个科目不在本行范围内，用于确认不会被误加
+            "2203": (9999.0, 9999.0),
+        }, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        # 期末 = 2000+400+600 = 3000
+        self.assertTrue(approx(hook.get("G27"), 3000.0),
+                        f"其他应付款期末应为 3000,实际 {hook.get('G27')}")
+        # 年初 = 1000+300+500 = 1800
+        self.assertTrue(approx(hook.get("H27"), 1800.0),
+                        f"其他应付款年初应为 1800,实际 {hook.get('H27')}")
+
+    def test_other_payables_without_interest_and_dividend(self):
+        """应付利息/应付股利无记录时，其他应付款 = 2241 本身（不能空白）。"""
+        rows = make_rows({"2241": (1000.0, 2000.0)}, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        self.assertTrue(approx(hook.get("G27"), 2000.0))
+        self.assertTrue(approx(hook.get("H27"), 1000.0))
+
     def test_intangible_assets_net(self):
         """无形资产 = 1701 - 1702（累计摊销）- 1703（减值准备）。
 
