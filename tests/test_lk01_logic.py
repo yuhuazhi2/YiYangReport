@@ -197,6 +197,51 @@ class TestRowValues(unittest.TestCase):
         self.assertTrue(approx(hook.get("H49"), 500.0),
                         f"递延所得税负债年初应为 500,实际 {hook.get('H49')}")
 
+    def test_2711_merged_into_long_term_payable(self):
+        """2711 专项应付款并入长期应付款（G43/H43），不单列到 G51。
+
+        【这是一次口径纠正的记录】
+            此前曾把 2711 配到 G51「其他非流动负债」，属理解错误。
+            经财务纠正：专项应付款在报表上并入"长期应付款"列示。
+
+        【本条锁定两件事】
+            1. 2711 必须计入 G43；
+            2. G51 必须**不写数**。若两处都写，同一笔负债会被拆到
+               两个项目 —— G43 偏小、G51 虚增，且合计口径也会错。
+        """
+        rows = make_rows({
+            "2701": (1000.0, 2000.0),   # 长期应付款
+            "2711": (300.0, 400.0),     # 专项应付款（并入本行）
+            "2702": (100.0, 150.0),     # 未确认融资费用（减项）
+        }, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        # 期末 = 2000 + 400 - 150 = 2250
+        self.assertTrue(approx(hook.get("G43"), 2250.0),
+                        f"长期应付款期末应为 2250,实际 {hook.get('G43')}")
+        # 年初 = 1000 + 300 - 100 = 1200
+        self.assertTrue(approx(hook.get("H43"), 1200.0),
+                        f"长期应付款年初应为 1200,实际 {hook.get('H43')}")
+
+        # 其他非流动负债必须保持空白
+        self.assertIsNone(hook.get("G51"),
+                          f"G51 不应被写入,实际 {hook.get('G51')}")
+        self.assertIsNone(hook.get("H51"))
+
+    def test_other_non_current_liabilities_is_pending(self):
+        """其他非流动负债（G51/H51）应登记为待定项，不参与取数。
+
+        【为什么锁这条？】
+            该行曾被误实现（取 2711），后回退。若日后有人再度把它
+            加进 ROW_SPECS，本条会立刻失败并提示：
+            口径尚未确认，且 2711 已归属长期应付款。
+        """
+        self.assertFalse(any(s.end_cell == "G51" for s in ROW_SPECS),
+                         "其他非流动负债不应出现在 ROW_SPECS 中")
+        pending_cells = {cells for _, cells, _ in PENDING_ROWS}
+        self.assertIn("G51/H51", pending_cells,
+                      "其他非流动负债应在 PENDING_ROWS 中")
+
     def test_long_term_payable_is_net_of_unrecognized_financing_cost(self):
         """长期应付款 = 2701 - 2702（未确认融资费用）。
 
