@@ -43,6 +43,30 @@ from reports.lk01_sample import (                          # noqa: E402
 )
 
 
+def split_cell(cell: str) -> tuple[int, str]:
+    """把 "C49" 拆成 (49, "C")。
+
+    【为什么需要它？】
+        资产负债表的资产侧(C/D)与负债侧(G/H)**共用行号**。
+        只按行号判断"是否同一行"会出错：
+            第 49 行左侧 = 其中：固定资产清理（汇总须排除）
+            第 49 行右侧 = 递延所得税负债（正常参与汇总）
+        必须"行号 + 列位"一起比，才是真正的同一格。
+    """
+    col = cell[0]
+    row_no = int("".join(ch for ch in cell if ch.isdigit()))
+    return row_no, col
+
+
+def excluded_cells() -> set[tuple[int, str]]:
+    """把 SUM_EXCLUDED_ROWS 展开成 {(行号, 列位)} 集合。"""
+    return {
+        (row_no, col)
+        for row_no, _name, cols in SUM_EXCLUDED_ROWS
+        for col in cols
+    }
+
+
 def run_report(rows=None, month=5, fail=False):
     """跑一遍 LK01 的 fetch + write,返回 (hook, ctx)。
 
@@ -130,6 +154,68 @@ class TestRowValues(unittest.TestCase):
 
         self.assertTrue(approx(hook.get("G27"), 2000.0))
         self.assertTrue(approx(hook.get("H27"), 1000.0))
+
+    def test_non_current_liabilities_three_rows(self):
+        """长期借款/长期应付款/递延所得税负债 三行各取各的科目。
+
+        【需求 20261030 第 26、27、29 条】
+
+        【为什么三行一起测？】
+            这三行口径完全相同（单科目、与 C11/D11 一致），
+            单看每一行都很简单；真正容易出错的是**相互串位**：
+                · 长期借款 2501 在 G39，短期借款 2001 在 G11
+                · 长期应付款 2701 在 G43，其他应付款 2241 在 G27
+                · 递延所得税负债 2901 在 G49，递延所得税资产 1901 在 C61
+            三组名称都只差一两个字/一个方向，若复制粘贴时漏改
+            科目或格位，单行测试可能恰好都"看起来对"。
+            同时给全部数据，任一处串位都会让本条失败。
+        """
+        rows = make_rows({
+            "2501": (1000.0, 2000.0),    # 长期借款
+            "2701": (300.0, 400.0),      # 长期应付款
+            "2901": (500.0, 600.0),      # 递延所得税负债
+            # 下面三个是"易混科目"，用于确认不会被误加到本三行
+            "2001": (9999.0, 9999.0),    # 短期借款
+            "2241": (8888.0, 8888.0),    # 其他应付款
+            "1901": (7777.0, 7777.0),    # 递延所得税资产
+        }, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        # 长期借款：期末取 2501 的 me、年初取 2501 的 mb
+        self.assertTrue(approx(hook.get("G39"), 2000.0),
+                        f"长期借款期末应为 2000,实际 {hook.get('G39')}")
+        self.assertTrue(approx(hook.get("H39"), 1000.0),
+                        f"长期借款年初应为 1000,实际 {hook.get('H39')}")
+        # 长期应付款
+        self.assertTrue(approx(hook.get("G43"), 400.0),
+                        f"长期应付款期末应为 400,实际 {hook.get('G43')}")
+        self.assertTrue(approx(hook.get("H43"), 300.0),
+                        f"长期应付款年初应为 300,实际 {hook.get('H43')}")
+        # 递延所得税负债
+        self.assertTrue(approx(hook.get("G49"), 600.0),
+                        f"递延所得税负债期末应为 600,实际 {hook.get('G49')}")
+        self.assertTrue(approx(hook.get("H49"), 500.0),
+                        f"递延所得税负债年初应为 500,实际 {hook.get('H49')}")
+
+    def test_long_term_payable_not_confused_with_other_payables(self):
+        """长期应付款(2701) 不得把其他应付款(2241) 算进来。
+
+        【为什么单独再测一次？】
+            "其他应付款"与"长期应付款"中文名只差两字，但科目与行次
+            完全不同（第 27 行 vs 第 43 行）。若把 2701 写成 2241，
+            报表仍会输出一个看似正常的数字，只有逐笔核对才能发现。
+            本条把 2241 给一个极不合理的值（8888），一旦串用立刻暴露。
+        """
+        rows = make_rows({
+            "2241": (1000.0, 2000.0),
+            "2701": (300.0, 400.0),
+        }, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        self.assertTrue(approx(hook.get("G43"), 400.0),
+                        f"长期应付款期末应为 400,实际 {hook.get('G43')}")
+        self.assertTrue(approx(hook.get("H43"), 300.0),
+                        f"长期应付款年初应为 300,实际 {hook.get('H43')}")
 
     def test_intangible_assets_net(self):
         """无形资产 = 1701 - 1702（累计摊销）- 1703（减值准备）。
@@ -602,15 +688,13 @@ class TestConfigConsistency(unittest.TestCase):
             非流动资产合计会偏大恰好一个 1606 的金额，
             而报表上每个单元格看起来都"很正常"。
         """
-        excluded_row_nos = {row_no for row_no, _ in SUM_EXCLUDED_ROWS}
+        excluded = excluded_cells()
 
         for spec in ROW_SPECS:
-            # 从格位里取行号（如 "C49" → 49）
-            row_no = int("".join(ch for ch in spec.end_cell if ch.isdigit()))
-            if row_no in excluded_row_nos:
+            if split_cell(spec.end_cell) in excluded:
                 self.assertFalse(
                     spec.in_subtotal,
-                    f"「{spec.label}」对应第 {row_no} 行，属汇总须排除的明细行，"
+                    f"「{spec.label}」({spec.end_cell}) 属汇总须排除的明细行，"
                     f"应设 in_subtotal=False，否则合计会重复计算")
 
     def test_all_other_rows_in_subtotal(self):
@@ -619,14 +703,39 @@ class TestConfigConsistency(unittest.TestCase):
         防止有人为了"先让它不出数"而随手把某行设成 False，
         导致合计静默变少。
         """
-        excluded_row_nos = {row_no for row_no, _ in SUM_EXCLUDED_ROWS}
+        excluded = excluded_cells()
         for spec in ROW_SPECS:
-            row_no = int("".join(ch for ch in spec.end_cell if ch.isdigit()))
-            if row_no not in excluded_row_nos:
+            if split_cell(spec.end_cell) not in excluded:
                 self.assertTrue(
                     spec.in_subtotal,
                     f"「{spec.label}」({spec.end_cell}) 应参与汇总，"
                     f"却被设为 in_subtotal=False")
+
+    def test_right_side_row49_not_excluded(self):
+        """负债侧第 49 行（递延所得税负债 G49）不得被当成"其中"明细排除。
+
+        【这条是被真实 bug 逼出来的】
+            汇总排除清单原先只记行号 49（指资产侧"其中：固定资产清理"）。
+            新增递延所得税负债到 G49 后，按行号比对的测试立刻把它
+            误判为须排除的明细行。
+
+            若顺着测试提示把 G49 设成 in_subtotal=False，
+            合计就会静默漏掉递延所得税负债 —— 报表上每一格都"正常"，
+            只有合计偏小，几乎无法察觉。
+
+            所以本条固定要求：同号不同列的两行，左侧排除、右侧参与。
+        """
+        # 资产侧第 49 行：其中：固定资产清理，必须排除
+        self.assertIn((49, "C"), excluded_cells(),
+                      "资产侧 C49「其中：固定资产清理」应在排除清单中")
+
+        # 负债侧第 49 行：递延所得税负债，绝不能排除
+        self.assertNotIn((49, "G"), excluded_cells(),
+                         "负债侧 G49「递延所得税负债」不应在排除清单中")
+
+        spec = next(s for s in ROW_SPECS if s.end_cell == "G49")
+        self.assertTrue(spec.in_subtotal,
+                        "递延所得税负债应参与汇总，否则合计会静默漏项")
 
     def test_summary_todo_not_conflict(self):
         """待实现汇总行的格位,不得与现有已实现行冲突。"""
