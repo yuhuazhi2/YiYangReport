@@ -773,6 +773,57 @@ class TestConfigConsistency(unittest.TestCase):
             self.assertIsNone(hook.get(cell),
                               f"待定行 {cell} 不应被写入，实际 {hook.get(cell)}")
 
+    def test_lease_and_provision_liabilities_not_processed(self):
+        """租赁负债(G41/H41)、预计负债(G45/H45) 确认不做处理，不参与取数。
+
+        【20261030 现场确认：不做处理】
+
+        【为什么要测"不做"？】
+            这两行此前既没实现、也没登记，与曾经漏掉的 G31/G33 情形相同。
+            现在明确"不做处理"后，这个决定必须**在代码里可验证**：
+              · 不能出现在 ROW_SPECS（否则会写出数）；
+              · 必须出现在 PENDING_ROWS（否则日后又被当成遗漏重新翻出来）。
+
+        【负债侧非流动区段至此完整，不再有空洞】
+            G39 长期借款(实现) → G41 租赁负债(待定) → G43 长期应付款(实现)
+            → G45 预计负债(待定) → G47 递延收益(实现)
+            → G49 递延所得税负债(实现) → G51 其他非流动负债(待定)
+        """
+        impl = set()
+        for spec in ROW_SPECS:
+            impl.add(spec.end_cell)
+            impl.add(spec.begin_cell)
+        pending = {cells for _, cells, _ in PENDING_ROWS}
+
+        for cells in ("G41/H41", "G45/H45"):
+            for cell in cells.split("/"):
+                self.assertNotIn(cell, impl,
+                                 f"{cell} 已确认不做处理，不应出现在 ROW_SPECS 中")
+            self.assertIn(cells, pending,
+                          f"{cells} 应登记在 PENDING_ROWS 中")
+
+    def test_lease_and_provision_cells_not_written(self):
+        """租赁负债/预计负债的四个格位必须保持空白（含正向数据也不写）。
+
+        【与上一条互补：一条查配置，一条查实际行为】
+            配置正确不代表行为正确 —— 若别处逻辑误写这几格
+            （例如复制某行配置时漏改格位），报表仍会多出数。
+            本条给足数据跑一遍，这四格必须仍为 None。
+        """
+        rows = make_rows({
+            "2701": (1000.0, 2000.0),
+            "2711": (300.0, 400.0),
+            "2702": (100.0, 150.0),
+            "2501": (500.0, 600.0),
+            "2901": (700.0, 800.0),
+        }, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        for cell in ("G41", "H41", "G45", "H45"):
+            self.assertIsNone(hook.get(cell),
+                              f"{cell} 已确认不做处理，不应被写入，"
+                              f"实际 {hook.get(cell)}")
+
     def test_summary_excluded_rows_have_in_subtotal_false(self):
         """汇总时须排除的行，若已实现则必须 in_subtotal=False。
 
