@@ -546,6 +546,42 @@ class TestConfigConsistency(unittest.TestCase):
                     f"待定项 {cell} 被「{seen.get(cell)}」和「{name}」同时占用")
                 seen[cell] = name
 
+    def test_pending_liabilities_due_within_year_and_other_current(self):
+        """「一年内到期的非流动负债」「其他流动负债」必须登记在待定清单里。
+
+        【为什么专门锁这两项？】
+            这两行在需求文档里**从未被提及**，此前既没实现、也没登记待定，
+            属于"连待定清单都没有"的状态 —— 读代码的人无法分辨
+            是"忘了做"还是"有意不做"。
+
+            20261030 现场确认：暂不实现取数，但要显式登记为有意留空。
+            本条测试就是防止日后有人"整理待定清单"时把它们删掉，
+            使状态又退回不可分辨。
+
+        【格位由模板核实得出】
+            模板 LK01 第 31 行 E31="  一年内到期的非流动负债"（行次 41）
+            模板 LK01 第 33 行 E33="  其他流动负债"（行次 42）
+            负债侧列位为 G（期末）/ H（年初），故为 G31/H31、G33/H33。
+        """
+        pending_cells = {cells for _, cells, _ in PENDING_ROWS}
+        self.assertIn("G31/H31", pending_cells,
+                      "「一年内到期的非流动负债」(行次41) 应在 PENDING_ROWS 中")
+        self.assertIn("G33/H33", pending_cells,
+                      "「其他流动负债」(行次42) 应在 PENDING_ROWS 中")
+
+    def test_pending_liabilities_not_written(self):
+        """待定的负债行不应被写入任何金额（确认"暂时不理"真的没写数）。
+
+        【为什么值得测？】
+            PENDING_ROWS 只是文档性常量，若有人误把其中一项也加进
+            ROW_SPECS（复制粘贴时漏删），报表就会多出一行数，
+            而这条能立刻发现。
+        """
+        hook, _ = run_report([], month=5)
+        for cell in ("G31", "H31", "G33", "H33"):
+            self.assertIsNone(hook.get(cell),
+                              f"待定行 {cell} 不应被写入，实际 {hook.get(cell)}")
+
     def test_summary_excluded_rows_have_in_subtotal_false(self):
         """汇总时须排除的行，若已实现则必须 in_subtotal=False。
 
