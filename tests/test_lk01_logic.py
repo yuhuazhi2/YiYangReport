@@ -197,6 +197,66 @@ class TestRowValues(unittest.TestCase):
         self.assertTrue(approx(hook.get("H49"), 500.0),
                         f"递延所得税负债年初应为 500,实际 {hook.get('H49')}")
 
+    def test_long_term_payable_is_net_of_unrecognized_financing_cost(self):
+        """长期应付款 = 2701 - 2702（未确认融资费用）。
+
+        【需求 20261030 第 27 条调整】
+
+        【为什么要减？】
+            2702「未确认融资费用」是长期应付款的备抵科目，
+            与"累计折旧之于固定资产"同理。报表应按净额列示，
+            若漏减，负债会被虚增，而报表上只看到一个合计数，
+            看不出多算了什么。
+
+        【验证点】
+            1. 减项生效（若漏减，结果偏大）；
+            2. 加减方向正确（若把 2702 当加项，结果偏得更多）；
+            3. 期末与年初各自扣各自的期间数据。
+        """
+        rows = make_rows({
+            "2701": (10000.0, 12000.0),   # 长期应付款
+            "2702": (2000.0, 3000.0),     # 未确认融资费用（减项）
+            # 易混科目，不应参与本行
+            "2241": (8888.0, 8888.0),
+        }, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        # 期末 = 12000 - 3000 = 9000
+        self.assertTrue(approx(hook.get("G43"), 9000.0),
+                        f"长期应付款期末应为 9000,实际 {hook.get('G43')}")
+        # 年初 = 10000 - 2000 = 8000
+        self.assertTrue(approx(hook.get("H43"), 8000.0),
+                        f"长期应付款年初应为 8000,实际 {hook.get('H43')}")
+
+    def test_long_term_payable_without_unrecognized_financing_cost(self):
+        """2702 无记录时，长期应付款 = 2701 本身（不能空白）。
+
+        【边界情形】未确认融资费用余额为 0 是常见的
+        （融资费用已摊销完毕，或本就没有融资性质业务）。
+        此时减项贡献 0，必须仍写出 2701 的金额。
+        """
+        rows = make_rows({"2701": (10000.0, 12000.0)}, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        self.assertTrue(approx(hook.get("G43"), 12000.0))
+        self.assertTrue(approx(hook.get("H43"), 10000.0))
+
+    def test_long_term_payable_only_unrecognized_cost_skipped(self):
+        """只有 2702、没有 2701 时不写负数。
+
+        【为什么不写？】
+            数据异常时若照算，G43 会变成 -3000 这种不可能的负债。
+            宁可留空让人查，也不写一个方向错误的数。
+            这与"只有坏账准备、没有应收账款"的处理完全一致，
+            因为 has_end 只由**加项**科目设置。
+        """
+        rows = make_rows({"2702": (2000.0, 3000.0)}, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        self.assertIsNone(hook.get("G43"),
+                          f"不应写入负数,实际 {hook.get('G43')}")
+        self.assertIsNone(hook.get("H43"))
+
     def test_long_term_payable_not_confused_with_other_payables(self):
         """长期应付款(2701) 不得把其他应付款(2241) 算进来。
 
