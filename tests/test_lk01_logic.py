@@ -242,6 +242,82 @@ class TestRowValues(unittest.TestCase):
         self.assertIn("G51/H51", pending_cells,
                       "其他非流动负债应在 PENDING_ROWS 中")
 
+    def test_owners_equity_three_rows(self):
+        """实收资本/资本公积/盈余公积 三行各取各的科目（需求 30、31、32）。
+
+        【为什么三行一起测？】
+            三行口径完全相同（单科目、与 C11/D11 一致），单看每行都简单；
+            真正容易出错的是**相互串位**：
+                · 实收资本 4001 在 G59
+                · 资本公积 4002 在 G61
+                · 盈余公积 410401 在 G63
+            三者格位连续（59/61/63）、科目编码也只差末几位，
+            复制粘贴时漏改任一处的概率很高。
+            同时给全部数据，任一处串位都会让本条失败。
+        """
+        rows = make_rows({
+            "4001": (1000.0, 2000.0),     # 实收资本
+            "4002": (300.0, 400.0),       # 资本公积
+            "410401": (500.0, 600.0),     # 盈余公积-法定
+            # 下面两个是"易混科目"，确认不会被误加到本三行
+            "4104": (7777.0, 7777.0),     # 盈余公积一级科目
+            "410402": (8888.0, 8888.0),   # 盈余公积-任意
+        }, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        # 实收资本：期末取 4001 的 me、年初取 4001 的 mb
+        self.assertTrue(approx(hook.get("G59"), 2000.0),
+                        f"实收资本期末应为 2000,实际 {hook.get('G59')}")
+        self.assertTrue(approx(hook.get("H59"), 1000.0),
+                        f"实收资本年初应为 1000,实际 {hook.get('H59')}")
+        # 资本公积
+        self.assertTrue(approx(hook.get("G61"), 400.0),
+                        f"资本公积期末应为 400,实际 {hook.get('G61')}")
+        self.assertTrue(approx(hook.get("H61"), 300.0),
+                        f"资本公积年初应为 300,实际 {hook.get('H61')}")
+        # 盈余公积（只取 410401）
+        self.assertTrue(approx(hook.get("G63"), 600.0),
+                        f"盈余公积期末应为 600,实际 {hook.get('G63')}")
+        self.assertTrue(approx(hook.get("H63"), 500.0),
+                        f"盈余公积年初应为 500,实际 {hook.get('H63')}")
+
+    def test_surplus_reserve_takes_detail_code_only(self):
+        """盈余公积只取明细科目 410401，不含 4104 一级科目与其他明细。
+
+        【为什么这条值得单独测？】
+            需求给的是 **410401（六位）**，而非 4104（四位）。
+            U8 里 4104 下通常有 410401 法定、410402 任意、410403 公益金。
+            若误把 codes 写成 ("4104",)，在本表的**精确匹配**口径下
+            只能取到一级科目自身那条记录，取不到任何明细 ——
+            结果会是 0 或空白，而报表上看不出"少了明细"。
+
+            反过来说，若误把 410402 也加进来，金额会偏大。
+            本条给三个不同金额，任一处串用立即暴露。
+        """
+        rows = make_rows({
+            "410401": (100.0, 200.0),     # 法定盈余公积（应取）
+            "4104": (3000.0, 4000.0),     # 一级科目（不应取）
+            "410402": (5000.0, 6000.0),   # 任意盈余公积（不应取）
+        }, month=5)
+        hook, _ = run_report(rows, month=5)
+
+        self.assertTrue(approx(hook.get("G63"), 200.0),
+                        f"盈余公积期末应只含 410401=200,实际 {hook.get('G63')}")
+        self.assertTrue(approx(hook.get("H63"), 100.0),
+                        f"盈余公积年初应只含 410401=100,实际 {hook.get('H63')}")
+
+    def test_owners_equity_without_data_stays_blank(self):
+        """三个权益科目都无记录时，六格保持空白（不写 0）。
+
+        【边界情形】新建账套或尚未注资时，4001/4002 可能无记录。
+        按本表统一约定：**没取到数据就保持空白**，让空白本身
+        成为"未取数"的信号，而不是谎报"实收资本为零"。
+        """
+        hook, _ = run_report([], month=5)
+        for cell in ("G59", "H59", "G61", "H61", "G63", "H63"):
+            self.assertIsNone(hook.get(cell),
+                              f"{cell} 无数据时应保持空白，实际 {hook.get(cell)}")
+
     def test_long_term_payable_is_net_of_unrecognized_financing_cost(self):
         """长期应付款 = 2701 - 2702（未确认融资费用）。
 
