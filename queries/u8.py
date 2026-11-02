@@ -85,7 +85,35 @@ def gl_account_summary(year: int, month: int) -> tuple[str, list]:
 
 
 def gl_vouchers(year: int, month: int) -> tuple[str, list]:
-    """凭证分录（GL_accvouch）：取指定期间已记账凭证"""
+    """凭证分录（GL_accvouch）：取指定期间已记账凭证
+
+    【字段来源说明（20261102 现场确认，字典有两处漏列）】
+        项目自带的 GL_accvouch表字典.xlsx 是手工整理材料，"可能不完整"。
+        实测该字典**漏列了以下两个字段**，但真实表里都存在：
+
+            iyear    会计年度（如 2026）
+            iYPeriod 年月整数（如 202601 = 2026年1月）
+
+        所以 `WHERE iyear = ?` 与 `WHERE iYPeriod = ?` 两种写法都可用，
+        不要因为字典里查不到就误以为列名有误。
+        详见 docs/GL_accvouch字段补充说明.md。
+
+    【已记账口径的注意点（待现场核实，暂不修改）】
+        这里用 `cbook IS NOT NULL` 判断已记账。
+        U8 中 cbook（记账人）为空串 '' 与 NULL 是两回事，
+        `IS NOT NULL` 对 '' 成立，会把"记账人为空串"的记录算作已记账。
+        另有一个专门的标志位 `ibook`（tinyint），与 cbook 是否恒等尚未核实。
+        核实方法见 docs/GL_accvouch字段补充说明.md 第二节。
+
+    【GL_accvouch 关键字段小抄】
+        iyear     会计年度（如 2026）
+        iYPeriod  年月整数（如 202601 = 2026年1月）—— 字典漏列
+        iperiod   会计期间（月份 1~12）
+        ccode     科目编码（认科目看它）
+        md / mc   借方金额 / 贷方金额（认金额看它）
+        ccode_equal  对方科目编码（要剔除特定对方科目时靠它）
+        csign / ino_id / inid  凭证类别字 / 凭证编号 / 行号
+    """
     sql = """
         SELECT ccode, cdigest, md, mc, cdept_id, cperson_id, ccus_id,
                csup_id, citem_id, cbook, ibook, csign, isignseq
@@ -321,7 +349,163 @@ def gl_period_balance(year: int, month: int,
 
 
 # ---------------------------------------------------------------------------
-# 三、往来类（应收/应付）
+# 三、利润表（发生额类，LK02）
+# ---------------------------------------------------------------------------
+def _placeholders(n: int) -> str:
+    """生成 n 个 SQL 参数占位符，如 n=3 → "?, ?, ?"。
+
+    【为什么单独抽出来？】
+        本文件多处要按"科目个数"动态生成 IN (?, ?, ...)。
+        集中一处，避免每处各写一遍 join，也防止某处漏写空格导致语法错误。
+    """
+    return ", ".join("?" for _ in range(n))
+
+
+def gl_profit_amount_by_period(
+    year: int,
+    codes: tuple[str, ...],
+    *,
+    amount_side: str = "debit",
+    digest_keywords: tuple[str, ...] = (),
+    equal_codes: tuple[str, ...] = (),
+    booked_only: bool = False,
+) -> tuple[str, list]:
+    """利润表取数：按期间汇总某批科目的**发生额**（取自 GL_accvouch）。
+
+    【为什么利润表要用 GL_accvouch，而不是 GL_accsum？】
+        GL_accsum 是"科目汇总"，一行一科目一期间，快但**不可再筛**。
+        利润表有若干项目必须按摘要、对方科目筛选，例如：
+            · 只取月末"结转损益"那部分（而非该科目全部发生额）
+            · 剔除"记入营业外收入"的开票收入
+        这些条件只有凭证分录（GL_accvouch）能表达。
+
+    【需求现场口径（LK02 行次2 出口主营业务收入，20261102 确认）】
+        同时满足以下条件：
+          ① 年度/期间匹配：iYPeriod 落在 [YYYY01, YYYY12] 区间内，
+             其中 YYYYMM 形如 202601（= 2026年1月）
+          ② ccode = 指定科目（本行为 600102）
+          ③ cdigest 包含「损益结转」「结转损益」「自动结转损益」之一
+          ④ ccode_equal（对方科目）= 4103（本年利润）
+          ⑤ 取 md（借方金额）合计
+
+        【为什么用 iYPeriod 而不是 iyear + iperiod？】
+            现场确认 GL_accvouch 同时具备三种期间表达：
+                iyear    = 2026
+                iperiod  = 1
+                iYPeriod = 202601     ← 字典漏列，但真实存在
+            三者语义等价，但 iYPeriod 把年与月合成一个整数：
+              · 单字段范围过滤 [YYYY01, YYYY12]，一次覆盖全年 12 个月；
+              · 不必写 "iyear=2026 AND iperiod BETWEEN 1 AND 12" 两个条件；
+              · 与用友前台"按年月查询"的习惯一致，便于与财务核对。
+
+            【仍然保留 iyear = ? 作为冗余保险】
+                两个条件同时成立才算命中。若现场存在
+                "iyear=2026 但 iYPeriod 落在别的年份"的脏数据，
+                加上 iyear 能把它排除掉，避免静默混入。
+                代价只是一条 AND，不影响索引使用。
+
+        【为什么取借方 md？】
+            收入类科目平时记贷方；月末结转到本年利润时，分录是
+                「借：主营业务收入 xxx / 贷：本年利润 xxx」
+            即结转金额出现在**借方 md**。
+            所以"某月该科目已结转的金额" = 该月结转凭证里这条科目的 md 合计。
+
+            【重要】这意味着本函数取的是"已结转"口径。
+            若客户存在"当月尚未结转损益"的情形，该月会取不到数（表格留空）。
+            这属于业务事实，不是程序缺陷 —— 留空比填错更好，且日志会写明原因。
+
+        【为什么必须限定对方科目 4103？】
+            同一科目也可能因冲销、调账、红字冲回等产生分录。
+            只看摘要关键字会把这些误纳进来。加上 ccode_equal=4103 后，
+            只认"确实结转到本年利润"的那一条，口径才干净。
+
+        【关于摘要关键字的三种写法】
+            「结转损益」是「自动结转损益」的子串，看似冗余；
+            但不同账套/不同结转模板生成的摘要措辞不一致，
+            多列一种写法可覆盖「损益结转」这类倒装表述，
+            代价只是一条 OR 条件，几乎无性能损失。
+
+    【参数】
+        year             会计年度：用于 iyear 过滤，并据此生成
+                         iYPeriod 区间 [YYYY01, YYYY12]
+        codes            科目编码集合（精确匹配，可多个）
+        amount_side      "debit" → SUM(md)；"credit" → SUM(mc)
+        digest_keywords  摘要关键字（任一命中即可）；空元组 = 不限摘要
+        equal_codes      对方科目编码集合（精确匹配）；空元组 = 不限对方科目
+        booked_only      是否只取已记账凭证；默认 False
+
+            【为什么默认 False？】
+                需求本次只给了"摘要 + 对方科目"两个条件，未要求过滤记账状态。
+                "结转损益"凭证在实务中必然已记账，加不加此条件结果通常一致。
+                保留开关是为了将来口径收紧时无需改函数。
+                【注意】本函数用的是 `cbook IS NOT NULL AND cbook <> ''`：
+                U8 里记账人为空串与 NULL 是两回事，只判 IS NOT NULL 会把
+                空串记录也当成已记账（详见 docs/GL_accvouch字段补充说明.md）。
+
+    【返回】
+        [(ccode, iperiod, amount), ...]，按 (iperiod, ccode) 排序。
+
+        【为什么按月分组返回，而不是直接给一个合计数？】
+            LK02 要把 12 个月分别填进 12 个格子（C~N）。
+            只有按月分组，才能"每月各自一格"，也便于日志逐月核对
+            "这个月的数由哪几个科目、哪几张凭证构成"。
+
+    【参数顺序警告】
+        params 的组装顺序必须与 SQL 里 ? 出现的顺序**严格一致**：
+            iyear → iYPeriod 下限 → iYPeriod 上限
+                  → ccode 列表 → 摘要关键字列表 → 对方科目列表
+        任何一个顺序错了，都会静默取到错误的数（不报错），极难发现。
+    """
+    if amount_side == "debit":
+        amount_expr = "md"
+    elif amount_side == "credit":
+        amount_expr = "mc"
+    else:
+        raise ValueError(
+            f"amount_side 只能是 'debit' 或 'credit'，收到 {amount_side!r}"
+        )
+
+    if not codes:
+        raise ValueError("codes 不能为空：利润表每行至少应指定一个科目")
+
+    # iYPeriod 是"年月整数"，如 2026 年 → 202601 ~ 202612。
+    # 【为什么用区间而不是 IN (12 个值)？】
+    #   区间写法更短、可读，且 SQL Server 对 BETWEEN 能直接用索引；
+    #   若写成 IN (202601, ..., 202612) 也能跑，但条件串长且易漏。
+    yperiod_begin = int(f"{year}01")
+    yperiod_end = int(f"{year}12")
+
+    where: list[str] = [
+        "iyear = ?",
+        "iYPeriod BETWEEN ? AND ?",
+        f"ccode IN ({_placeholders(len(codes))})",
+    ]
+    params: list[Any] = [int(year), yperiod_begin, yperiod_end, *codes]
+
+    if digest_keywords:
+        or_clause = " OR ".join("cdigest LIKE ?" for _ in digest_keywords)
+        where.append(f"({or_clause})")
+        params.extend(f"%{kw}%" for kw in digest_keywords)
+
+    if equal_codes:
+        where.append(f"ccode_equal IN ({_placeholders(len(equal_codes))})")
+        params.extend(equal_codes)
+
+    if booked_only:
+        where.append("cbook IS NOT NULL AND cbook <> ''")
+
+    sql = f"""
+        SELECT ccode, iperiod, SUM({amount_expr}) AS amount
+        FROM GL_accvouch
+        WHERE {' AND '.join(where)}
+        GROUP BY ccode, iperiod
+        ORDER BY iperiod, ccode
+    """
+    return sql, params
+
+
+# ---------------------------------------------------------------------------
+# 四、往来类（应收/应付）
 # ---------------------------------------------------------------------------
 def ar_aging(year: int, month: int) -> tuple[str, list]:
     """应收账款明细 + 辅助（通过 GL_accass 取客户维度）
@@ -367,7 +551,7 @@ def ap_aging(year: int, month: int) -> tuple[str, list]:
 
 
 # ---------------------------------------------------------------------------
-# 四、存货类
+# 五、存货类
 # ---------------------------------------------------------------------------
 def inventory_balance(year: int, month: int) -> tuple[str, list]:
     """存货现存量 / 结存（ST_CurrentStock 或汇总表）
@@ -427,7 +611,7 @@ def rd_records(year: int, month: int) -> tuple[str, list]:
 
 
 # ---------------------------------------------------------------------------
-# 五、固定资产
+# 六、固定资产
 # ---------------------------------------------------------------------------
 def fa_cards(year: int, month: int) -> tuple[str, list]:
     """固定资产卡片（fa_Cards）
@@ -466,7 +650,7 @@ def fa_depreciation(year: int, month: int) -> tuple[str, list]:
 
 
 # ---------------------------------------------------------------------------
-# 六、薪资类
+# 七、薪资类
 # ---------------------------------------------------------------------------
 def salary_data(year: int, month: int, wa_class: str = "") -> tuple[str, list]:
     """工资数据（wa_GZData）。wa_class 为工资类别编码
@@ -503,7 +687,7 @@ def salary_data(year: int, month: int, wa_class: str = "") -> tuple[str, list]:
 
 
 # ---------------------------------------------------------------------------
-# 七、账套注册信息（系统库 UFSystem）—— 决定"该连哪个年度库"
+# 八、账套注册信息（系统库 UFSystem）—— 决定"该连哪个年度库"
 # ---------------------------------------------------------------------------
 def account_database(system_database: str, acc_id: str, year: int) -> tuple[str, list]:
     """查询"某账套在某年度"对应的年度库名（如 UFDATA_001_2026）。
@@ -584,7 +768,7 @@ def list_accounts(system_database: str) -> tuple[str, list]:
 
 
 # ---------------------------------------------------------------------------
-# 八、元数据 / 诊断（供核对与排错）
+# 九、元数据 / 诊断（供核对与排错）
 # ---------------------------------------------------------------------------
 def check_table_exists(table_name: str) -> tuple[str, list]:
     """检查表是否存在（用于取数前校验）
