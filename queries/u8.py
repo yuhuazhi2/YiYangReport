@@ -429,7 +429,8 @@ def gl_profit_amount_by_period(
         year             会计年度：用于 iyear 过滤，并据此生成
                          iYPeriod 区间 [YYYY01, YYYY12]
         codes            科目编码集合（精确匹配，可多个）
-        amount_side      "debit" → SUM(md)；"credit" → SUM(mc)
+        amount_side      "debit" → SUM(md)（收入行用）
+                         "credit" → SUM(mc)（成本费用行用）
         digest_keywords  摘要关键字（任一命中即可）；空元组 = 不限摘要
         equal_codes      对方科目编码集合（精确匹配）；空元组 = 不限对方科目
         booked_only      是否只取已记账凭证；默认 False
@@ -444,6 +445,9 @@ def gl_profit_amount_by_period(
 
     【返回】
         [(ccode, iperiod, amount), ...]，按 (iperiod, ccode) 排序。
+
+        amount 是该行指定方向（amount_side）的合计：
+        借方则 md 之和，贷方则 mc 之和。
 
         【为什么按月分组返回，而不是直接给一个合计数？】
             LK02 要把 12 个月分别填进 12 个格子（C~N）。
@@ -494,6 +498,23 @@ def gl_profit_amount_by_period(
     if booked_only:
         where.append("cbook IS NOT NULL AND cbook <> ''")
 
+    # 【★ 为什么只 SUM 一列，而不是两列都取？ ★】
+    #
+    #   本函数按 amount_side 只汇总指定的那一侧：
+    #       amount_side="debit"  → SUM(md)，收入行用
+    #       amount_side="credit" → SUM(mc)，成本费用行用
+    #
+    #   【为什么不做成"一次同时取两列"以省一次往返？】
+    #     那样确实少一次数据库往返，但方向只体现在"报表层选哪一列"，
+    #     SQL 文本本身看不出这组是借方还是贷方。
+    #
+    #     保持单列后：
+    #       · 查成本组时 SQL 里就是 SUM(mc)，审查 SQL 时一眼可确认口径；
+    #       · 某行 direction 若配错，SQL 会直接查错列 → 结果为空，
+    #         问题在"取数"这一步就暴露，而不是推迟到报表层选列。
+    #
+    #     代价是收入组与成本组各发一次查询。两者筛选条件相同、
+    #     只是金额列不同，多一次往返可接受。
     sql = f"""
         SELECT ccode, iperiod, SUM({amount_expr}) AS amount
         FROM GL_accvouch
