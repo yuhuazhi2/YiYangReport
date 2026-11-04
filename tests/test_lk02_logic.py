@@ -965,7 +965,7 @@ class TestExportCost(unittest.TestCase):
             any("SUM(md)" in s for s in sqls),
             f"应有一条 SQL 使用 SUM(md)，实际：{sqls}")
 
-    def test_direction_difference_still_one_query(self):
+    def test_direction_split_creates_two_queries(self):
         """收入行取借方、成本行取贷方，但仍只发 1 次查询。
 
         【这条测试的期望值曾经是错的，记录一下】
@@ -984,8 +984,8 @@ class TestExportCost(unittest.TestCase):
         _, ctx = run_report([])
 
         self.assertEqual(
-            len(ctx.fetch_calls), 1,
-            f"应合并为 1 次查询（一次取回借贷两列），"
+            len(ctx.fetch_calls), 2,
+            f"收入组(debit)与成本组(credit)方向不同，应各发 1 次、共 2 次查询，"
             f"实际 {len(ctx.fetch_calls)} 次")
 
     def test_excel_row_mapping_for_cost(self):
@@ -999,6 +999,607 @@ class TestExportCost(unittest.TestCase):
             容易误写成 13 或 15；写错会把成本数填到相邻行上。
         """
         self.assertEqual(EXCEL_ROW[6], 14)
+
+
+class TestDomesticCost(unittest.TestCase):
+    """需求第 6 条：行次7「其中：内销主营业务成本」（Excel 第 15 行）。
+
+    口径与第 5 条（出口成本）相同，科目 640101，方向 credit（取贷方 mc）。
+    新增降级机制：640101 无数据时改用一级科目 6401。
+    """
+
+    def test_c15_is_january(self):
+        """C15 必须是 1 月内销成本（640101）。"""
+        hook, _ = run_report([("640101", 1, 2468.0)], month=1)
+
+        self.assertTrue(approx(hook.get("C15"), 2468.0),
+                        f"C15（1月）应为 2468，实际 {hook.get(chr(39)+chr(67)+chr(49)+chr(53)+chr(39))}")
+        self.assertTrue(approx(hook.get("O15"), 2468.0))
+        self.assertIsNone(hook.get("D15"))
+
+    def test_twelve_months_written(self):
+        """12 个月各自写入对应列，O15 = 12 个月之和。"""
+        rows = make_amount_rows({"640101": {m: m * 2.0 for m in range(1, 13)}})
+        hook, _ = run_report(rows, month=12)
+
+        for month, col in COL_OF_MONTH.items():
+            self.assertTrue(approx(hook.get(f"{col}15"), month * 2.0))
+        self.assertTrue(approx(hook.get("O15"), 156.0))
+
+    def test_direction_is_credit(self):
+        """内销成本行的 direction 必须是 credit（与收入行相反）。"""
+        spec = next(s for s in ROW_SPECS if s.key == "内销主营业务成本")
+
+        self.assertEqual(spec.direction, "credit")
+        self.assertEqual(spec.codes, ("640101",))
+        self.assertEqual(spec.excel_row, EXCEL_ROW[7], "应写第 15 行")
+
+    def test_fallback_codes_configured(self):
+        """备用科目必须配成 6401（现场要求）。"""
+        spec = next(s for s in ROW_SPECS if s.key == "内销主营业务成本")
+
+        self.assertEqual(spec.fallback_codes, ("6401",),
+                         "640101 不存在时应降级用一级科目 6401")
+
+    def test_use_fallback_when_main_absent(self):
+        """640101 整年无数据时，改用 6401 填列第 15 行。"""
+        hook, _ = run_report([("6401", 1, 888.0), ("6401", 2, 999.0)], month=2)
+
+        self.assertTrue(approx(hook.get("C15"), 888.0),
+                        f"降级后 C15 应为 6401 的 888，实际 {hook.get(chr(39)+chr(67)+chr(49)+chr(53)+chr(39))}")
+        self.assertTrue(approx(hook.get("D15"), 999.0))
+        self.assertTrue(approx(hook.get("O15"), 1887.0))
+
+    def test_no_fallback_when_main_has_data(self):
+        """640101 有数据时绝不掺入 6401（防重复计算）。"""
+        hook, _ = run_report([("640101", 1, 555.0), ("6401", 1, 888.0)], month=1)
+
+        self.assertTrue(approx(hook.get("C15"), 555.0),
+                        f"应用 640101 的 555，实际 {hook.get(chr(39)+chr(67)+chr(49)+chr(53)+chr(39))}")
+
+    def test_blank_when_both_absent(self):
+        """主备科目都没有数据时，整行空白。"""
+        hook, _ = run_report([], month=1)
+
+        for col in (*COL_OF_MONTH.values(), COL_YEAR_TOTAL):
+            self.assertIsNone(hook.get(f"{col}15"))
+
+    def test_not_crossed_with_export_cost(self):
+        """内销成本(15行)与出口成本(14行)互不串用。"""
+        rows = make_amount_rows({
+            "640102": {3: 1000.0},
+            "640101": {3: 100.0},
+        })
+        hook, _ = run_report(rows, month=3)
+
+        self.assertTrue(approx(hook.get("E14"), 1000.0))
+        self.assertTrue(approx(hook.get("E15"), 100.0))
+
+    def test_excel_row_mapping(self):
+        """内销主营业务成本对应 Excel 第 15 行（行次 7）。"""
+        self.assertEqual(EXCEL_ROW[7], 15)
+
+class TestOtherBusinessCost(unittest.TestCase):
+    """需求第 7 条：行次8「其中：其他业务成本」（Excel 第 16 行）。
+
+    口径与第 5、6 条相同，科目 6402，方向 credit（取贷方 mc）。
+    """
+
+    def test_c16_is_january(self):
+        """C16 必须是 1 月其他业务成本（6402）。"""
+        hook, _ = run_report([("6402", 1, 1357.0)], month=1)
+
+        self.assertTrue(approx(hook.get("C16"), 1357.0),
+                        f"C16（1月）应为 1357，实际 {hook.get('C16')}")
+        self.assertTrue(approx(hook.get("O16"), 1357.0))
+        self.assertIsNone(hook.get("D16"))
+
+    def test_twelve_months_written(self):
+        """12 个月各自写入对应列，O16 = 12 个月之和。"""
+        rows = make_amount_rows({"6402": {m: m * 4.0 for m in range(1, 13)}})
+        hook, _ = run_report(rows, month=12)
+
+        for month, col in COL_OF_MONTH.items():
+            self.assertTrue(approx(hook.get(f"{col}16"), month * 4.0))
+        self.assertTrue(approx(hook.get("O16"), 312.0))
+
+    def test_direction_is_credit(self):
+        """其他业务成本行的 direction 必须是 credit。"""
+        spec = next(s for s in ROW_SPECS if s.key == "其他业务成本")
+
+        self.assertEqual(spec.direction, "credit")
+        self.assertEqual(spec.codes, ("6402",))
+        self.assertEqual(spec.excel_row, EXCEL_ROW[8], "应写第 16 行")
+
+    def test_no_fallback_configured(self):
+        """其他业务成本未配备用科目（现场未要求）。"""
+        spec = next(s for s in ROW_SPECS if s.key == "其他业务成本")
+
+        self.assertEqual(spec.fallback_codes, ())
+
+    def test_not_crossed_with_other_cost_rows(self):
+        """三行成本（14/15/16）互不串用。"""
+        rows = make_amount_rows({
+            "640102": {3: 1000.0},
+            "640101": {3: 100.0},
+            "6402":   {3: 1.0},
+        })
+        hook, _ = run_report(rows, month=3)
+
+        self.assertTrue(approx(hook.get("E14"), 1000.0),
+                        f"E14（出口成本）应为 1000，实际 {hook.get('E14')}")
+        self.assertTrue(approx(hook.get("E15"), 100.0),
+                        f"E15（内销成本）应为 100，实际 {hook.get('E15')}")
+        self.assertTrue(approx(hook.get("E16"), 1.0),
+                        f"E16（其他业务成本）应为 1，实际 {hook.get('E16')}")
+
+    def test_blank_when_no_data(self):
+        """6402 无数据时整行空白（不写 0）。"""
+        hook, _ = run_report([], month=1)
+
+        for col in (*COL_OF_MONTH.values(), COL_YEAR_TOTAL):
+            self.assertIsNone(hook.get(f"{col}16"),
+                              f"{col}16 无数据时应空白，"
+                              f"实际 {hook.get(f'{col}16')}")
+
+    def test_excel_row_mapping(self):
+        """其他业务成本对应 Excel 第 16 行（行次 8）。"""
+        self.assertEqual(EXCEL_ROW[8], 16)
+
+
+class TestTaxAndSellingExpense(unittest.TestCase):
+    """需求第 8 条：两行成本费用项目（口径与其他业务成本完全相同）。
+
+        ① 行次 9「其中：税金及附加」科目 6403 → C17:N17 + O17
+        ② 行次 10「其中：销售费用」  科目 6601 → C18:N18 + O18
+    """
+
+    def test_c17_is_january(self):
+        """C17 必须是 1 月税金及附加（6403）。"""
+        hook, _ = run_report([("6403", 1, 4321.0)], month=1)
+
+        self.assertTrue(approx(hook.get("C17"), 4321.0),
+                        f"C17（1月）应为 4321，实际 {hook.get('C17')}")
+        self.assertTrue(approx(hook.get("O17"), 4321.0))
+        self.assertIsNone(hook.get("D17"))
+
+    def test_c18_is_january(self):
+        """C18 必须是 1 月销售费用（6601）。"""
+        hook, _ = run_report([("6601", 1, 5678.0)], month=1)
+
+        self.assertTrue(approx(hook.get("C18"), 5678.0),
+                        f"C18（1月）应为 5678，实际 {hook.get('C18')}")
+        self.assertTrue(approx(hook.get("O18"), 5678.0))
+        self.assertIsNone(hook.get("D18"))
+
+    def test_twelve_months_written(self):
+        """两行各自 12 个月全部写入，O 列累计正确。"""
+        rows = make_amount_rows({
+            "6403": {m: m * 10.0 for m in range(1, 13)},
+            "6601": {m: m * 20.0 for m in range(1, 13)},
+        })
+        hook, _ = run_report(rows, month=12)
+
+        for month, col in COL_OF_MONTH.items():
+            self.assertTrue(
+                approx(hook.get(f"{col}17"), month * 10.0),
+                f"{col}17（{month}月）应为 {month * 10.0}")
+            self.assertTrue(
+                approx(hook.get(f"{col}18"), month * 20.0),
+                f"{col}18（{month}月）应为 {month * 20.0}")
+
+        self.assertTrue(approx(hook.get("O17"), 780.0))
+        self.assertTrue(approx(hook.get("O18"), 1560.0))
+
+    def test_direction_is_credit(self):
+        """两行方向都必须是 credit（成本费用类取贷方 mc）。"""
+        for key, code, excel_row in (
+            ("税金及附加", "6403", 17),
+            ("销售费用", "6601", 18),
+        ):
+            with self.subTest(key=key):
+                spec = next(s for s in ROW_SPECS if s.key == key)
+                self.assertEqual(spec.direction, "credit")
+                self.assertEqual(spec.codes, (code,))
+                self.assertEqual(spec.excel_row, excel_row)
+
+    def test_two_rows_not_crossed(self):
+        """税金及附加(17)与销售费用(18)互不串用。"""
+        rows = make_amount_rows({
+            "6403": {3: 1000.0},
+            "6601": {3: 1.0},
+        })
+        hook, _ = run_report(rows, month=3)
+
+        self.assertTrue(approx(hook.get("E17"), 1000.0),
+                        f"E17（税金及附加）应为 1000，实际 {hook.get('E17')}")
+        self.assertTrue(approx(hook.get("E18"), 1.0),
+                        f"E18（销售费用）应为 1，实际 {hook.get('E18')}")
+
+    def test_blank_when_no_data(self):
+        """两行都无数据时整行空白（不写 0）。"""
+        hook, _ = run_report([], month=1)
+
+        for row in (17, 18):
+            for col in (*COL_OF_MONTH.values(), COL_YEAR_TOTAL):
+                self.assertIsNone(hook.get(f"{col}{row}"),
+                                  f"{col}{row} 无数据时应空白，"
+                                  f"实际 {hook.get(f'{col}{row}')}")
+
+    def test_no_fallback_configured(self):
+        """两行都未配备用科目（现场未要求）。"""
+        for key in ("税金及附加", "销售费用"):
+            spec = next(s for s in ROW_SPECS if s.key == key)
+            self.assertEqual(spec.fallback_codes, ())
+
+    def test_excel_row_mapping(self):
+        """行次 9 → Excel 第 17 行；行次 10 → Excel 第 18 行。"""
+        self.assertEqual(EXCEL_ROW[9], 17)
+        self.assertEqual(EXCEL_ROW[10], 18)
+
+    def test_cost_group_merged_in_one_query(self):
+        """所有成本费用行合并在同一次 SUM(mc) 查询。"""
+        _, ctx = run_report([])
+
+        cost_calls = [c for c in ctx.fetch_calls if "SUM(mc)" in c["sql"]]
+        self.assertEqual(
+            len(cost_calls), 1,
+            f"所有成本费用行应合并为 1 条 SUM(mc) 查询，"
+            f"实际 {len(cost_calls)} 条")
+
+        params = cost_calls[0]["params"]
+        for code in ("640101", "640102", "6402", "6403", "6601"):
+            self.assertIn(code, params,
+                          f"成本组查询应包含科目 {code}")
+
+
+class TestAdminAndRndExpense(unittest.TestCase):
+    """需求第 9 条：管理费用与研发费用（首对"净额 + 单列"组合）。
+
+        ① 行次 11「其中：管理费用」= 6602 － 660253 → C19:N19 + O19
+        ② 行次 12「其中：研发费用」= 660253        → C20:N20 + O20
+
+    【为什么要一起测？】
+        这两行共享同一个科目 660253：第19行作**减项**、第20行作**加项**。
+        单独测任一行都看不出"共享科目是否被重复或漏算"，
+        必须成对验证「第19行 + 第20行 = 6602 全额」这个恒等式。
+    """
+
+    def test_admin_is_net_of_rnd(self):
+        """C19 = 6602 － 660253（净额列示）。"""
+        hook, _ = run_report([("6602", 1, 1000.0), ("660253", 1, 300.0)],
+                             month=1)
+
+        self.assertTrue(approx(hook.get("C19"), 700.0),
+                        f"C19（管理费用净额）应为 700，实际 {hook.get('C19')}")
+
+    def test_rnd_is_detail_code(self):
+        """C20 = 660253（取明细科目本身）。"""
+        hook, _ = run_report([("6602", 1, 1000.0), ("660253", 1, 300.0)],
+                             month=1)
+
+        self.assertTrue(approx(hook.get("C20"), 300.0),
+                        f"C20（研发费用）应为 300，实际 {hook.get('C20')}")
+
+    def test_admin_plus_rnd_equals_total(self):
+        """第19行 + 第20行 = 6602 全额（关键恒等式）。
+
+        【为什么这条最重要？】
+            660253 同时归属两行：第19行减、第20行加。
+            若映射写成单值字典（后写覆盖前写），会出现：
+                · 只减不加 → 两行合计偏小（少一笔研发费用）
+                · 只加不减 → 两行合计偏大（多算一笔）
+                · 完全丢失 → 某一行为空
+            而报表上每格都"有数字"，看不出任何异常。
+
+            本条用一组具体数字验证恒等式，任一处串位立刻失败。
+        """
+        total_admin = 1000.0
+        rnd = 300.0
+        hook, _ = run_report([
+            ("6602", 1, total_admin),
+            ("660253", 1, rnd),
+        ], month=1)
+
+        admin = hook.get("C19")
+        rnd_cell = hook.get("C20")
+        self.assertTrue(
+            approx((admin or 0) + (rnd_cell or 0), total_admin),
+            f"管理费用 {admin} + 研发费用 {rnd_cell} 应等于 6602 全额 "
+            f"{total_admin}，实际和 {(admin or 0) + (rnd_cell or 0)}")
+
+    def test_twelve_months_both_rows(self):
+        """两行各自 12 个月正确，O 列累计正确。"""
+        rows = make_amount_rows({
+            "6602": {m: m * 100.0 for m in range(1, 13)},
+            "660253": {m: m * 30.0 for m in range(1, 13)},
+        })
+        hook, _ = run_report(rows, month=12)
+
+        for month, col in COL_OF_MONTH.items():
+            self.assertTrue(
+                approx(hook.get(f"{col}19"), month * 70.0),
+                f"{col}19（{month}月）应为 {month * 70.0}，"
+                f"实际 {hook.get(f'{col}19')}")
+            self.assertTrue(
+                approx(hook.get(f"{col}20"), month * 30.0),
+                f"{col}20（{month}月）应为 {month * 30.0}，"
+                f"实际 {hook.get(f'{col}20')}")
+
+        # 1..12 月 70 的倍数之和 = 70 * 78 = 5460
+        self.assertTrue(approx(hook.get("O19"), 5460.0))
+        # 30 * 78 = 2340
+        self.assertTrue(approx(hook.get("O20"), 2340.0))
+        # 两者相加应等于 6602 全年 = 100 * 78 = 7800
+        self.assertTrue(approx(hook.get("O19") + hook.get("O20"), 7800.0))
+
+    def test_admin_without_rnd(self):
+        """660253 无记录时，管理费用 = 6602 全额（不减、不留空）。
+
+        【注意列位】month=5 对应 5 月列 G，不是 C（1月）。
+        """
+        hook, _ = run_report([("6602", 5, 888.0)], month=5)
+
+        self.assertTrue(approx(hook.get("G19"), 888.0),
+                        f"G19（5月）应为 6602 全额 888，实际 {hook.get('G19')}")
+        self.assertIsNone(hook.get("H20"),
+                          f"研发费用无数据时应空白，实际 {hook.get('H20')}")
+
+    def test_rnd_only_skips_admin(self):
+        """只有 660253、没有 6602 时，C19 不写负数。
+
+        【为什么？】
+            与 LK01 的"只有减项"情形同一原则：has 只由**加项**设置。
+            此时若照算，C19 会变成 -300（负数管理费用，不可能）。
+            宁可留空让人查，也不写一个方向错误的数。
+        """
+        hook, _ = run_report([("660253", 1, 300.0)], month=1)
+
+        self.assertIsNone(hook.get("C19"),
+                          f"不应写入负数，实际 {hook.get('C19')}")
+        # 但研发费用行应正常有数
+        self.assertTrue(approx(hook.get("C20"), 300.0),
+                        f"C20 应为 300，实际 {hook.get('C20')}")
+
+    def test_direction_both_credit(self):
+        """两行方向都必须是 credit。"""
+        for key, excel_row in (("管理费用", 19), ("研发费用", 20)):
+            with self.subTest(key=key):
+                spec = next(s for s in ROW_SPECS if s.key == key)
+                self.assertEqual(spec.direction, "credit")
+                self.assertEqual(spec.excel_row, excel_row)
+
+    def test_admin_config_declares_exclude(self):
+        """管理费用行必须声明减项 660253（配置层面固化口径）。"""
+        spec = next(s for s in ROW_SPECS if s.key == "管理费用")
+
+        self.assertEqual(spec.codes, ("6602",))
+        self.assertEqual(spec.exclude_codes, ("660253",),
+                         "管理费用应按净额列示，须减 660253 研发费用")
+
+    def test_rnd_config_uses_detail_code(self):
+        """研发费用行必须取明细码 660253（不是 6602）。"""
+        spec = next(s for s in ROW_SPECS if s.key == "研发费用")
+
+        self.assertEqual(spec.codes, ("660253",))
+        self.assertEqual(spec.exclude_codes, ())
+
+    def test_two_rows_not_crossed_with_other_expense(self):
+        """管理费用/研发费用 不与其他成本费用行串用。"""
+        rows = make_amount_rows({
+            "6602": {3: 1000.0},
+            "660253": {3: 300.0},
+            "6601": {3: 5.0},      # 销售费用，不应进 19/20 行
+            "6603": {3: 7.0},      # 其他科目，不应进 19/20 行
+        })
+        hook, _ = run_report(rows, month=3)
+
+        self.assertTrue(approx(hook.get("E19"), 700.0),
+                        f"E19 应为 700，实际 {hook.get('E19')}")
+        self.assertTrue(approx(hook.get("E20"), 300.0),
+                        f"E20 应为 300，实际 {hook.get('E20')}")
+        self.assertTrue(approx(hook.get("E18"), 5.0),
+                        f"E18（销售费用）应不受影响，实际 {hook.get('E18')}")
+
+    def test_blank_when_no_data(self):
+        """两行都无数据时整行空白。"""
+        hook, _ = run_report([], month=1)
+
+        for row in (19, 20):
+            for col in (*COL_OF_MONTH.values(), COL_YEAR_TOTAL):
+                self.assertIsNone(hook.get(f"{col}{row}"),
+                                  f"{col}{row} 无数据时应空白，"
+                                  f"实际 {hook.get(f'{col}{row}')}")
+
+    def test_excel_row_mapping(self):
+        """行次 11 → Excel 第 19 行；行次 12 → Excel 第 20 行。"""
+        self.assertEqual(EXCEL_ROW[11], 19)
+        self.assertEqual(EXCEL_ROW[12], 20)
+
+    def test_shared_code_in_both_rows(self):
+        """660253 必须同时出现在两行的科目映射中（一减一加）。
+
+        【为什么直接检查配置而非只看结果？】
+            运行结果只能说明"这次取到了正确的数"，
+            但无法说明"映射结构本身是否支持一个科目归属两行"。
+            若将来有人把 code_to_rows 改成单值字典，
+            某些场景下结果仍可能"碰巧正确"（例如两行恰好同号），
+            这条从配置层面把"660253 属于两行"的事实钉死。
+        """
+        admin = next(s for s in ROW_SPECS if s.key == "管理费用")
+        rnd = next(s for s in ROW_SPECS if s.key == "研发费用")
+
+        self.assertIn("660253", admin.exclude_codes,
+                      "660253 应作为管理费用的减项")
+        self.assertIn("660253", rnd.codes,
+                      "660253 应作为研发费用的加项")
+
+
+class TestFinanceExpense(unittest.TestCase):
+    """需求第 10 条：财务费用及其两个"其中"明细。
+
+        ① 行次 13「其中：财务费用」6603    → C21:N21 + O21
+        ② 行次 14「其中：利息费用」660311  → C22:N22 + O22
+        ③ 行次 15「其中：利息收入」660302  → C23:N23 + O23
+
+    【本类的核心验证点：第21行取全额、不减去两个下级】
+        与第 9 条（管理费用减研发费用）形成对照：
+        研发费用是**并列项目**（模板第20行不带"其中："），故要减；
+        利息费用/利息收入带"其中："前缀，属**明细说明**，故不减。
+        若这里也减，财务费用会偏小，且报表上看不出异常。
+    """
+
+    def test_c21_is_january(self):
+        """C21 必须是 1 月财务费用（6603）全额。"""
+        hook, _ = run_report([("6603", 1, 2600.0)], month=1)
+
+        self.assertTrue(approx(hook.get("C21"), 2600.0),
+                        f"C21（1月）应为 2600，实际 {hook.get('C21')}")
+        self.assertTrue(approx(hook.get("O21"), 2600.0))
+        self.assertIsNone(hook.get("D21"))
+
+    def test_c22_is_january(self):
+        """C22 必须是 1 月利息费用（660311）。"""
+        hook, _ = run_report([("660311", 1, 1800.0)], month=1)
+
+        self.assertTrue(approx(hook.get("C22"), 1800.0),
+                        f"C22（1月）应为 1800，实际 {hook.get('C22')}")
+        self.assertTrue(approx(hook.get("O22"), 1800.0))
+
+    def test_c23_is_january(self):
+        """C23 必须是 1 月利息收入（660302）。"""
+        hook, _ = run_report([("660302", 1, 300.0)], month=1)
+
+        self.assertTrue(approx(hook.get("C23"), 300.0),
+                        f"C23（1月）应为 300，实际 {hook.get('C23')}")
+        self.assertTrue(approx(hook.get("O23"), 300.0))
+
+    def test_finance_expense_is_gross_not_net(self):
+        """第21行取 6603 全额，**不减去**两个下级（与第9条对照）。
+
+        【为什么这条最关键？】
+            若照抄第 9 条管理费用的写法给本行加 exclude_codes
+            （减去 660311、660302），财务费用会偏小，
+            而营业利润会偏大 —— 两处同时错，报表上却每格都正常。
+
+            本条给：6603=2600、660311=1800、660302=300
+            正确：C21 = 2600（全额）
+            误减：C21 = 2600-1800-300 = 500（错）
+        """
+        hook, _ = run_report([
+            ("6603", 1, 2600.0),
+            ("660311", 1, 1800.0),
+            ("660302", 1, 300.0),
+        ], month=1)
+
+        self.assertTrue(
+            approx(hook.get("C21"), 2600.0),
+            f"C21（财务费用）应取 6603 全额 2600，不减去下级，"
+            f"实际 {hook.get('C21')}")
+
+    def test_finance_expense_config_has_no_exclude(self):
+        """配置层面固化：财务费用行不得设 exclude_codes。"""
+        spec = next(s for s in ROW_SPECS if s.key == "财务费用")
+
+        self.assertEqual(spec.codes, ("6603",))
+        self.assertEqual(
+            spec.exclude_codes, (),
+            "财务费用取 6603 全额；利息费用/利息收入是\"其中\"明细，"
+            "非并列项目，不应扣除")
+
+    def test_detail_rows_have_no_exclude_either(self):
+        """两个明细行同样不设减项。"""
+        for key, code in (("利息费用", "660311"), ("利息收入", "660302")):
+            with self.subTest(key=key):
+                spec = next(s for s in ROW_SPECS if s.key == key)
+                self.assertEqual(spec.codes, (code,))
+                self.assertEqual(spec.exclude_codes, ())
+
+    def test_three_rows_not_crossed(self):
+        """三行互不串用（给数量级差异明显的金额）。"""
+        rows = make_amount_rows({
+            "6603": {3: 2600.0},
+            "660311": {3: 1800.0},
+            "660302": {3: 300.0},
+        })
+        hook, _ = run_report(rows, month=3)
+
+        self.assertTrue(approx(hook.get("E21"), 2600.0),
+                        f"E21（财务费用）应为 2600，实际 {hook.get('E21')}")
+        self.assertTrue(approx(hook.get("E22"), 1800.0),
+                        f"E22（利息费用）应为 1800，实际 {hook.get('E22')}")
+        self.assertTrue(approx(hook.get("E23"), 300.0),
+                        f"E23（利息收入）应为 300，实际 {hook.get('E23')}")
+
+    def test_twelve_months_three_rows(self):
+        """三行各自 12 个月正确，O 列累计正确。"""
+        rows = make_amount_rows({
+            "6603": {m: m * 100.0 for m in range(1, 13)},
+            "660311": {m: m * 60.0 for m in range(1, 13)},
+            "660302": {m: m * 10.0 for m in range(1, 13)},
+        })
+        hook, _ = run_report(rows, month=12)
+
+        for month, col in COL_OF_MONTH.items():
+            self.assertTrue(approx(hook.get(f"{col}21"), month * 100.0))
+            self.assertTrue(approx(hook.get(f"{col}22"), month * 60.0))
+            self.assertTrue(approx(hook.get(f"{col}23"), month * 10.0))
+
+        # 1..12 之和 = 78
+        self.assertTrue(approx(hook.get("O21"), 7800.0))
+        self.assertTrue(approx(hook.get("O22"), 4680.0))
+        self.assertTrue(approx(hook.get("O23"), 780.0))
+
+    def test_direction_all_credit(self):
+        """三行方向都必须是 credit。
+
+        【为什么利息收入也取贷方？】
+            利息收入是财务费用的减项，结转时分录为
+            「借 本年利润 / 贷 财务费用-利息收入」，
+            金额同样出现在贷方 mc，与其他费用科目方向一致。
+        """
+        for key, excel_row in (
+            ("财务费用", 21),
+            ("利息费用", 22),
+            ("利息收入", 23),
+        ):
+            with self.subTest(key=key):
+                spec = next(s for s in ROW_SPECS if s.key == key)
+                self.assertEqual(spec.direction, "credit")
+                self.assertEqual(spec.excel_row, excel_row)
+
+    def test_blank_when_no_data(self):
+        """三行都无数据时整行空白。"""
+        hook, _ = run_report([], month=1)
+
+        for row in (21, 22, 23):
+            for col in (*COL_OF_MONTH.values(), COL_YEAR_TOTAL):
+                self.assertIsNone(hook.get(f"{col}{row}"),
+                                  f"{col}{row} 无数据时应空白，"
+                                  f"实际 {hook.get(f'{col}{row}')}")
+
+    def test_excel_row_mapping(self):
+        """行次 13→21、14→22、15→23。"""
+        self.assertEqual(EXCEL_ROW[13], 21)
+        self.assertEqual(EXCEL_ROW[14], 22)
+        self.assertEqual(EXCEL_ROW[15], 23)
+
+    def test_not_crossed_with_admin_and_rnd(self):
+        """财务费用系列不与管理费用/研发费用串用。"""
+        rows = make_amount_rows({
+            "6602": {3: 1000.0},
+            "660253": {3: 300.0},
+            "6603": {3: 2600.0},
+            "660311": {3: 1800.0},
+        })
+        hook, _ = run_report(rows, month=3)
+
+        self.assertTrue(approx(hook.get("E19"), 700.0),
+                        f"E19（管理费用净额）应为 700，实际 {hook.get('E19')}")
+        self.assertTrue(approx(hook.get("E20"), 300.0))
+        self.assertTrue(approx(hook.get("E21"), 2600.0),
+                        f"E21 应为 2600，实际 {hook.get('E21')}")
+        self.assertTrue(approx(hook.get("E22"), 1800.0))
 
 
 class TestTemplateConsistency(unittest.TestCase):
@@ -1065,112 +1666,3 @@ class TestTemplateConsistency(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
-        if not tpl.exists():
-            self.skipTest(f"模板不存在：{tpl}")
-
-        wb = xlrd.open_workbook(str(tpl))
-        sh = wb.sheet_by_name("LK02")
-
-        for row_no, excel_row in EXCEL_ROW.items():
-            # xlrd 从 0 开始；A 列是索引 0
-            val = str(sh.cell_value(excel_row - 1, 0)).strip()
-            self.assertTrue(
-                val,
-                f"行次 {row_no} 应为 Excel 第 {excel_row} 行，"
-                f"但该行 A 列是空的 —— 行号可能写错了")
-
-    def test_formula_rows_are_summary_rows(self):
-        """公式行（22/25/27）在模板中应是"二、三、四"开头的汇总项目。"""
-        try:
-            import xlrd
-        except ImportError:
-            self.skipTest("未安装 xlrd")
-
-        from config.settings import DEFAULT_TEMPLATE, PROJECT_ROOT
-
-        tpl = PROJECT_ROOT / DEFAULT_TEMPLATE
-        if not tpl.exists():
-            self.skipTest(f"模板不存在：{tpl}")
-
-        wb = xlrd.open_workbook(str(tpl))
-        sh = wb.sheet_by_name("LK02")
-
-        for row_no in FORMULA_ROWS:
-            excel_row = EXCEL_ROW[row_no]
-            val = str(sh.cell_value(excel_row - 1, 0)).strip()
-            self.assertTrue(
-                val.startswith(("二、", "三、", "四、")),
-                f"行次 {row_no}（Excel 第 {excel_row} 行）应是汇总行，"
-                f"实际 A 列文字为 {val!r}")
-
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-            excel_row = EXCEL_ROW[row_no]
-            val = str(sh.cell_value(excel_row - 1, 0)).strip()
-            self.assertTrue(
-                val.startswith(("二、", "三、", "四、")),
-                f"行次 {row_no}（Excel 第 {excel_row} 行）应是汇总行，"
-                f"实际 A 列文字为 {val!r}")
-
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-            可覆盖绝大部分错行情形。
-
-        【若模板文件不存在则跳过】，不影响其他测试。
-        """
-        try:
-            import xlrd
-        except ImportError:
-            self.skipTest("未安装 xlrd")
-
-        from config.settings import DEFAULT_TEMPLATE, PROJECT_ROOT
-
-        tpl = PROJECT_ROOT / DEFAULT_TEMPLATE
-        if not tpl.exists():
-            self.skipTest(f"模板不存在：{tpl}")
-
-        wb = xlrd.open_workbook(str(tpl))
-        sh = wb.sheet_by_name("LK02")
-
-        for row_no, excel_row in EXCEL_ROW.items():
-            # xlrd 从 0 开始；A 列是索引 0
-            val = str(sh.cell_value(excel_row - 1, 0)).strip()
-            self.assertTrue(
-                val,
-                f"行次 {row_no} 应为 Excel 第 {excel_row} 行，"
-                f"但该行 A 列是空的 —— 行号可能写错了")
-
-    def test_formula_rows_are_summary_rows(self):
-        """公式行（22/25/27）在模板中应是"二、三、四"开头的汇总项目。"""
-        try:
-            import xlrd
-        except ImportError:
-            self.skipTest("未安装 xlrd")
-
-        from config.settings import DEFAULT_TEMPLATE, PROJECT_ROOT
-
-        tpl = PROJECT_ROOT / DEFAULT_TEMPLATE
-        if not tpl.exists():
-            self.skipTest(f"模板不存在：{tpl}")
-
-        wb = xlrd.open_workbook(str(tpl))
-        sh = wb.sheet_by_name("LK02")
-
-        for row_no in FORMULA_ROWS:
-            excel_row = EXCEL_ROW[row_no]
-            val = str(sh.cell_value(excel_row - 1, 0)).strip()
-            self.assertTrue(
-                val.startswith(("二、", "三、", "四、")),
-                f"行次 {row_no}（Excel 第 {excel_row} 行）应是汇总行，"
-                f"实际 A 列文字为 {val!r}")
-
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-

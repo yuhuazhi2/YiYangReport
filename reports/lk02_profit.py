@@ -191,6 +191,52 @@ LK02 利润表
         下级金额已含在内 —— 改成前缀匹配会把同一笔金额算两遍。
         详见 ROW_SPECS 内注释与 test_exact_match_not_prefix。
 
+    [x] 需求第 6 条：行次 7「其中：内销主营业务成本」→ C15:N15 全 12 个月 + O15
+        口径与第 5 条（出口成本）完全相同，只有科目不同：
+        出口 640102 / 内销 640101，方向同为 credit（取贷方 mc）。
+        【新增降级机制 fallback_codes】
+        640101 现场尚未启用；若没有该科目，用一级科目 6401 代替。
+        实现：主科目与备用科目一起查回、**分开累加**，收口时择一使用：
+          · 主科目整年有任一月份记录 → 只用主科目
+          · 主科目整年无记录           → 改用备用科目（日志 WARNING 提示核对）
+        不逐月降级（会出现"1月用明细、2月用一级"的口径混用）；
+        主科目有数时绝不掺入备用科目（否则同一笔金额被算两遍）。
+
+    [x] 需求第 7 条：行次 8「其中：其他业务成本」→ C16:N16 全 12 个月 + O16
+        口径与前两条成本行完全相同，仅科目不同：6402（其他业务成本）。
+        方向 credit（取贷方 mc）。6402 是一级码，精确匹配不展开下级。
+        本行未标 optional、未配备用科目 —— 其他业务成本通常应有数，
+        取不到时应打 WARNING 提示核查。
+
+    [x] 需求第 8 条：两行成本费用项目（口径与其他业务成本完全相同）
+        ① 行次 9「其中：税金及附加」科目 6403 → C17:N17 + O17
+        ② 行次 10「其中：销售费用」 科目 6601 → C18:N18 + O18
+        方向均为 credit（取贷方 mc），摘要含结转损益类，对方科目 4103。
+        两个科目都是一级码，精确匹配、不展开下级。
+
+    [x] 需求第 9 条：管理费用与研发费用（首对"净额 + 单列"组合）
+        ① 行次 11「其中：管理费用」= 6602 － 660253 → C19:N19 + O19
+           设 codes=("6602",)、exclude_codes=("660253",)
+        ② 行次 12「其中：研发费用」= 660253 → C20:N20 + O20
+        方向均为 credit（取贷方 mc），摘要含结转损益类，对方科目 4103。
+
+        【设计要点】660253 同时归属两行（第19行作减项、第20行作加项），
+        靠 code_to_rows 的"科目 → [(行, 符号)]"多值映射实现，逻辑零改动。
+        两行相加应恰好等于 6602 全额；若对不上，说明还有别的下级明细。
+
+    [x] 需求第 10 条：财务费用及其两个"其中"明细（三条配置，逻辑零改动）
+        ① 行次 13「其中：财务费用」6603    → C21:N21 + O21
+        ② 行次 14「其中：利息费用」660311  → C22:N22 + O22
+        ③ 行次 15「其中：利息收入」660302  → C23:N23 + O23
+        方向均为 credit（取贷方 mc），摘要含结转损益类，对方科目 4103。
+
+        【关键口径差异（与第 9 条对照）】
+        第 9 条管理费用减了研发费用，因为研发费用在模板中是
+        并列项目（第 20 行不带"其中："），不减会重复计入营业利润。
+        本条三个项目中，利息费用/利息收入带"其中："前缀，
+        属对财务费用的明细说明，故第 21 行取 6603 全额、不减。
+        若减了反而使财务费用偏小。
+
     [ ] 需求后续条目：其余行项目待财务逐条给出
 
     每追加一行，只需在 ROW_SPECS 里加一条 ProfitRow，
@@ -350,9 +396,34 @@ class ProfitRow:
     exclude_codes: tuple[str, ...] = ()
     digest_keywords: tuple[str, ...] = ()
     equal_codes: tuple[str, ...] = ()
+    fallback_codes: tuple[str, ...] = ()
     fill_total: bool = True
     optional: bool = False
     note: str = ""
+
+    # 【fallback_codes 是为什么加的？（需求第 6 条）】
+    #  有些明细科目现场"还没添加使用"，但一级科目已经在用。
+    #  需求要求：若明细科目不存在，就用一级科目的值代替。
+    #
+    #  实现方式：主科目与备用科目一起查回，但**分开累加**：
+    #    · 主科目（codes）有任何月份的记录 → 只用主科目；
+    #    · 主科目整年无记录 → 改用备用科目（fallback_codes）。
+    #
+    #  【为什么不把两者放进同一个 codes 一起累加？】
+    #    会重复计算。以本表为例：6401 是主营业务成本一级科目，
+    #    其下可能同时有 640101（内销）与 640102（出口）。
+    #    若把 6401 和 640101 一起相加，出口成本会被算进内销成本行，
+    #    而报表上只显示一个偏大的数 —— 看不出异常。
+    #
+    #  【为什么用"整年无记录"而不是"逐月判断"？】
+    #    "科目是否存在"是账套级的属性，不是月份级的。
+    #    若按逐月降级，会出现"1 月用 640101、2 月用 6401"这种混用，
+    #    两段口径不同却拼在同一行里，无法解释也无法核对。
+    #
+    #  【残余风险（日志会提示）】
+    #    若 640101 已启用但整年都没做过结转，也会触发降级，
+    #    从而误用 6401（可能含出口成本）。这种情况 WARNING 会写明
+    #    "请核对是否与出口成本重复"，由人判断。
 
     # 【optional 是为什么加的？】
     #  有些科目现场"暂时还没启用，将来可能会用"（如需求第 5 条的 640102）。
@@ -485,6 +556,235 @@ ROW_SPECS: tuple[ProfitRow, ...] = (
         optional=True,
         note="ccode=640102 且摘要含结转损益类 且对方科目=4103，取 mc 合计",
     ),
+    ProfitRow(
+        key="内销主营业务成本",
+        label="其中：内销主营业务成本",
+        # 【需求第 6 条（20261103 现场确认）】
+        #   模板第 15 行 A 列 = '         内销主营业务成本'，行次 7
+        #   金额列：C15（1月）… N15（12月）、O15（本年累计）
+        #
+        # 【口径】与第 5 条（出口成本）完全相同，只有科目不同：
+        #   出口 640102 / 内销 640101，方向同样是 credit（取贷方 mc）。
+        #
+        # 【640101 目前尚未启用 → 降级用一级科目 6401】
+        #   现场说明：640101 现在还没添加使用，可能后期会添加；
+        #   若没有这个科目，就取 6401（主营业务成本）一级科目的值代替。
+        #
+        #   这正是 fallback_codes 的用途，详见该字段的说明。
+        #   关键：主科目与备用科目分开累加，主科目有数时绝不掺入备用科目 ——
+        #   否则 6401 里包含的 640102（出口成本）会被重复计进本行。
+        #
+        #   降级发生时日志会打 WARNING，提示核对是否与出口成本重复。
+        codes=("640101",),
+        direction="credit",
+        excel_row=EXCEL_ROW[7],
+        digest_keywords=DIGEST_SETTLE,
+        equal_codes=(EQUAL_PROFIT,),
+        fallback_codes=("6401",),
+        optional=True,
+        note="ccode=640101（无则降级 6401）且摘要含结转损益类 且对方科目=4103，取 mc 合计",
+    ),
+    ProfitRow(
+        key="其他业务成本",
+        label="其中：其他业务成本",
+        # 【需求第 7 条（20261103 现场确认）】
+        #   模板第 16 行 A 列 = '         其他业务成本'，行次 8
+        #   金额列：C16（1月）… N16（12月）、O16（本年累计）
+        #
+        # 【口径】与前两条成本行完全相同，只有科目不同：
+        #   出口 640102 / 内销 640101 / 其他业务 6402，方向同为 credit（取 mc）。
+        #
+        #   【注意 6402 也是一级科目】
+        #   6402「其他业务成本」直接取一级码，精确匹配。
+        #   与其他业务收入 6051 同理：本表一律精确匹配、不做前缀展开，
+        #   不要把 640201、640202 等下级码追加进来 —— 会重复计算。
+        #
+        #   【本行未启用 optional，也未配备用科目】
+        #   现场本次未提"暂未启用"，故按普通行处理：
+        #   若整年无数据会打 WARNING（提示检查科目/摘要/对方科目），
+        #   这是合理的 —— 其他业务成本通常都应当有数。
+        #   若后续确认该科目也未启用，再加 optional=True 与 fallback_codes 即可。
+        codes=("6402",),
+        direction="credit",
+        excel_row=EXCEL_ROW[8],
+        digest_keywords=DIGEST_SETTLE,
+        equal_codes=(EQUAL_PROFIT,),
+        note="ccode=6402 且摘要含结转损益类 且对方科目=4103，取 mc 合计",
+    ),
+    ProfitRow(
+        key="税金及附加",
+        label="其中：税金及附加",
+        # 【需求第 8 条第 1 项（20261103 现场确认）】
+        #   模板第 17 行 A 列 = '         税金及附加'，行次 9
+        #   金额列：C17（1月）… N17（12月）、O17（本年累计）
+        #
+        # 【口径】与其他业务成本完全相同，仅科目不同：6403。
+        #   方向 credit（取贷方 mc）、摘要含结转损益类、对方科目 4103。
+        #
+        #   【6403 是一级科目】精确匹配，不展开 640301 等下级。
+        codes=("6403",),
+        direction="credit",
+        excel_row=EXCEL_ROW[9],
+        digest_keywords=DIGEST_SETTLE,
+        equal_codes=(EQUAL_PROFIT,),
+        note="ccode=6403 且摘要含结转损益类 且对方科目=4103，取 mc 合计",
+    ),
+    ProfitRow(
+        key="销售费用",
+        label="其中：销售费用",
+        # 【需求第 8 条第 2 项（20261103 现场确认）】
+        #   模板第 18 行 A 列 = '         销售费用'，行次 10
+        #   金额列：C18（1月）… N18（12月）、O18（本年累计）
+        #
+        # 【口径】与前面各成本费用行相同，仅科目不同：6601（销售费用）。
+        #   方向 credit（取贷方 mc）、摘要含结转损益类、对方科目 4103。
+        #
+        #   【6601 是一级科目】精确匹配，不展开 660101 等下级。
+        #   若该账套把销售费用细分到明细科目，届时需按现场确认
+        #   逐个列出明细码，不能改成前缀匹配（会与 6601 汇总行重复）。
+        codes=("6601",),
+        direction="credit",
+        excel_row=EXCEL_ROW[10],
+        digest_keywords=DIGEST_SETTLE,
+        equal_codes=(EQUAL_PROFIT,),
+        note="ccode=6601 且摘要含结转损益类 且对方科目=4103，取 mc 合计",
+    ),
+    ProfitRow(
+        key="管理费用",
+        label="其中：管理费用（已扣研发费用）",
+        # 【需求第 9 条第 1 项（20261103 现场确认）】
+        #   模板第 19 行 A 列 = '         管理费用'，行次 11
+        #   金额列：C19（1月）… N19（12月）、O19（本年累计）
+        #
+        # 【★ 本条是本表第一个"净额行"：既要减项，又被另一行单列 ★】
+        #   口径：C19 = 6602（管理费用） － 660253（研发费用）
+        #
+        #   为什么要减？因为模板把"研发费用"单独列成第 20 行（行次 12），
+        #   而 U8 科目体系里 660253 是 6602 的下级明细科目。
+        #   若第 19 行直接取 6602 全额，第 20 行又单列 660253，
+        #   两个项目就会重叠 —— 营业利润的公式会把研发费用算两遍。
+        #
+        # 【为什么用 exclude_codes 而不是自己写减法？】
+        #   ProfitRow 的取数模型已是"最终值 = sum(codes) - sum(exclude_codes)"
+        #   （见 BalanceRow 的同名机制）。所以本条只需声明：
+        #       加项 codes = ("6602",)
+        #       减项 exclude_codes = ("660253",)
+        #   不需要在 fetch/write 里加任何"特殊行"分支。
+        #
+        # 【660253 同时出现在两行，会不会冲突？】
+        #   不会。code_to_rows 是"科目 → [(行, 符号)]"的**多值**映射：
+        #       660253 → [ (管理费用行, -1), (研发费用行, +1) ]
+        #   同一条取数记录会分别以负号累加到第19行、以正号累加到第20行，
+        #   两行互不干扰。这正是该映射设计成 list 而非单值的原因。
+        codes=("6602",),
+        exclude_codes=("660253",),
+        direction="credit",
+        excel_row=EXCEL_ROW[11],
+        digest_keywords=DIGEST_SETTLE,
+        equal_codes=(EQUAL_PROFIT,),
+        note="(ccode=6602 减 660253) 且摘要含结转损益类 且对方科目=4103，取 mc 合计",
+    ),
+    ProfitRow(
+        key="研发费用",
+        label="其中：研发费用",
+        # 【需求第 9 条第 2 项（20261103 现场确认）】
+        #   模板第 20 行 A 列 = '         研发费用'，行次 12
+        #   金额列：C20（1月）… N20（12月）、O20（本年累计）
+        #
+        # 【口径】类似其他业务成本：ccode=660253，方向 credit（mc），
+        #   摘要含结转损益类，对方科目 4103。
+        #
+        # 【注意取的是明细科目，不是一级科目】
+        #   660253 是 6602 下的明细科目（六位）。
+        #   这与第 19 行"用 6602 减去 660253"正好配对：
+        #       第19行 + 第20行 = 6602 全额
+        #   所以两行相加应恰好等于管理费用一级科目的结转额 ——
+        #   若对不上，说明还有别的 6602 下级明细致使拆分不完整。
+        codes=("660253",),
+        direction="credit",
+        excel_row=EXCEL_ROW[12],
+        digest_keywords=DIGEST_SETTLE,
+        equal_codes=(EQUAL_PROFIT,),
+        note="ccode=660253 且摘要含结转损益类 且对方科目=4103，取 mc 合计",
+    ),
+    ProfitRow(
+        key="财务费用",
+        label="其中：财务费用",
+        # 【需求第 10 条第 1 项（20261103 现场确认）】
+        #   模板第 21 行 A 列 = '         财务费用'，行次 13
+        #   金额列：C21（1月）… N21（12月）、O21（本年累计）
+        #
+        # 【口径】与其他业务成本相同：ccode=6603，方向 credit（mc），
+        #   摘要含结转损益类，对方科目 4103。
+        #
+        #   【本条取 6603 全额，不减其下级 660311/660302】
+        #   与第 9 条管理费用不同：那里减 660253 是因为"研发费用"在模板中
+        #   被单列为第 20 行，属并列项目，不减会重复计入营业利润。
+        #
+        #   而本行的两个下级（利息费用/利息收入）在模板中是
+        #   "其中"明细行（行次 14、15，带"其中："前缀），
+        #   属于对财务费用的补充说明，不参与营业利润公式的加总。
+        #   所以本行取全额，不减 —— 若减了反而会让财务费用偏小。
+        codes=("6603",),
+        direction="credit",
+        excel_row=EXCEL_ROW[13],
+        digest_keywords=DIGEST_SETTLE,
+        equal_codes=(EQUAL_PROFIT,),
+        note="ccode=6603 且摘要含结转损益类 且对方科目=4103，取 mc 合计",
+    ),
+    ProfitRow(
+        key="利息费用",
+        label="其中：利息费用",
+        # 【需求第 10 条第 2 项（20261103 现场确认）】
+        #   模板第 22 行 A 列 = '           其中：利息费用'，行次 14
+        #   金额列：C22（1月）… N22（12月）、O22（本年累计）
+        #
+        # 【口径】ccode=660311（财务费用下的利息费用明细），
+        #   方向 credit（mc）、摘要含结转损益类、对方科目 4103。
+        #
+        #   【为什么填数但不参与汇总？】
+        #   本行是"其中"类明细行：财务费用(第21行)已含此金额，
+        #   本行只是把它单独列出来供人看清构成。
+        #   若在营业利润公式里再减一次，财务费用就被重复扣减。
+        #
+        #   【区别于第 9 条】第 9 条的管理费用减了研发费用，
+        #   是因为研发费用被模板列为并列项目（第 20 行不带"其中："）。
+        #   而"利息费用"带"其中："前缀，属明细说明，故不减。
+        codes=("660311",),
+        direction="credit",
+        excel_row=EXCEL_ROW[14],
+        digest_keywords=DIGEST_SETTLE,
+        equal_codes=(EQUAL_PROFIT,),
+        note="ccode=660311 且摘要含结转损益类 且对方科目=4103，取 mc 合计",
+    ),
+    ProfitRow(
+        key="利息收入",
+        label="其中：利息收入",
+        # 【需求第 10 条第 3 项（20261103 现场确认）】
+        #   模板第 23 行 A 列 = '                  利息收入'，行次 15
+        #   金额列：C23（1月）… N23（12月）、O23（本年累计）
+        #
+        # 【口径】ccode=660302（财务费用下的利息收入明细），
+        #   方向 credit（mc）、摘要含结转损益类、对方科目 4103。
+        #
+        #   【关于方向：利息收入为何也取贷方 mc？】
+        #   会计上利息收入是财务费用的减项（贷记财务费用）。
+        #   月末结转时：
+        #       借 本年利润 / 贷 财务费用-利息收入
+        #   金额同样出现在贷方 mc，与其他费用科目的结转方向一致。
+        #   所以这里仍是 direction="credit"，不必反向。
+        #
+        #   【填报值的正负】
+        #   本行按贷方发生额原样填列（正数）。
+        #   报表阅读者看"利息收入 500"即知这是利息带来的收益，
+        #   无需显示为负数 —— 与模板"其中：利息收入"的表述一致。
+        codes=("660302",),
+        direction="credit",
+        excel_row=EXCEL_ROW[15],
+        digest_keywords=DIGEST_SETTLE,
+        equal_codes=(EQUAL_PROFIT,),
+        note="ccode=660302 且摘要含结转损益类 且对方科目=4103，取 mc 合计",
+    ),
 )
 
 
@@ -536,6 +836,8 @@ class LK02Report(BaseReport):
         #     · 没取到     → 应留空（说明未取数/未结转，需人查）
         #   若用金额是否为 0 来区分，这两种情况会被混为一谈。
         self.row_has: dict[str, set[int]] = {}
+        # {row_key: 是否用了备用科目} —— 供日志说明"这行数来自哪个科目"
+        self.row_fallback_used: dict[str, bool] = {}
 
     # ------------------------------------------------------------------
     # 第1步：取数
@@ -575,14 +877,35 @@ class LK02Report(BaseReport):
             sig = (spec.direction, spec.digest_keywords, spec.equal_codes)
             groups.setdefault(sig, []).append(spec)
 
-        # ---- 各行的累加器 ----
+        # ---- 各行的累加器（主科目）----
         values: dict[str, dict[int, float]] = {s.key: {} for s in ROW_SPECS}
         has: dict[str, set[int]] = {s.key: set() for s in ROW_SPECS}
 
+        # ---- 各行的累加器（备用科目）----
+        #
+        # 【为什么要单独一套累加器，而不是并进 values？】
+        #   主科目与备用科目是"择一使用"的关系，不是并列相加。
+        #   若混在一起累加，一旦主科目也有数，结果就会把两者叠加，
+        #   金额偏大且看不出异常。
+        #
+        #   【为什么不能简单地把 fallback 塞进 codes？】
+        #   以 6401 与 640101 为例：6401 是主营业务成本一级科目。
+        #   若两者同时有数，加起来会重复计算。
+        #   分开累加后，代码可以明确表达"有主科目就绝不用备用科目"。
+        fb_values: dict[str, dict[int, float]] = {s.key: {} for s in ROW_SPECS}
+        fb_has: dict[str, set[int]] = {s.key: set() for s in ROW_SPECS}
+
         for (direction, digests, equals), specs in groups.items():
-            # 组内科目的并集（含减项）
+            # 组内科目的并集（含减项，并包含备用科目）
+            #
+            # 【为什么备用科目也在同一次查询里取回？】
+            #   这样才能同时判断"主科目有没有数"和"备用科目是多少"。
+            #   若先查主科目、发现没有再去查备用，就是两次往返，
+            #   且两次结果来自不同时刻，可能出现新的不一致。
             all_codes = tuple(sorted({
-                c for s in specs for c in (*s.codes, *s.exclude_codes)
+                c
+                for s in specs
+                for c in (*s.codes, *s.exclude_codes, *s.fallback_codes)
             }))
             if not all_codes:
                 continue
@@ -622,14 +945,17 @@ class LK02Report(BaseReport):
                 logger.warning("[%s] 取数失败：%s", self.code, exc)
                 rows = []
 
-            # 科目 → [(所属行, 符号)]；符号 +1=加项，-1=减项
-            #   与 LK01 完全相同的多值映射：一个科目允许同时归属多行。
-            code_to_rows: dict[str, list[tuple[ProfitRow, int]]] = {}
+            # 科目 → [(所属行, 符号, 是否备用)]
+            #   符号 +1=加项，-1=减项；第三项 is_fb 决定进哪套累加器。
+            #   与 LK01 相同的多值映射：一个科目允许同时归属多行。
+            code_to_rows: dict[str, list[tuple[ProfitRow, int, bool]]] = {}
             for spec in specs:
                 for c in spec.codes:
-                    code_to_rows.setdefault(c, []).append((spec, +1))
+                    code_to_rows.setdefault(c, []).append((spec, +1, False))
                 for c in spec.exclude_codes:
-                    code_to_rows.setdefault(c, []).append((spec, -1))
+                    code_to_rows.setdefault(c, []).append((spec, -1, False))
+                for c in spec.fallback_codes:
+                    code_to_rows.setdefault(c, []).append((spec, +1, True))
 
             for row in rows:
                 try:
@@ -655,21 +981,74 @@ class LK02Report(BaseReport):
                                    self.code, iperiod, ccode)
                     continue
 
-                for spec, sign in code_to_rows.get(ccode, []):
+                for spec, sign, is_fb in code_to_rows.get(ccode, []):
                     # 【不需要再按 direction 选列】
                     #   同组内所有行 direction 相同（它就在分组键里），
                     #   取数函数的 amount_side 已保证查的是正确的一侧。
-                    #   这也意味着：若某行 direction 配错，它会落到另一个组、
-                    #   SQL 里也就查了另一列，结果是取不到数（空白），
-                    #   问题在取数层就暴露，而不是在报表层悄悄填错列。
-                    bucket = values[spec.key]
-                    bucket[iperiod] = bucket.get(iperiod, 0.0) + sign * amount
-                    # 【has 只由加项设置】与 LK01 同一原则：
-                    #   若某行只有减项科目有记录、加项没有（数据异常），
-                    #   累加结果会是负数。此时不标记"有数据"，
-                    #   该格不写 —— 宁可不写，也不写一个负数误导人。
-                    if sign > 0:
-                        has[spec.key].add(iperiod)
+                    #
+                    # 【is_fb 决定进哪套累加器】
+                    #   主科目 → values / has
+                    #   备用科目 → fb_values / fb_has
+                    #   两套分开，最后在收口时"择一使用"。
+                    if is_fb:
+                        bucket = fb_values[spec.key]
+                        bucket[iperiod] = bucket.get(iperiod, 0.0) + sign * amount
+                        if sign > 0:
+                            fb_has[spec.key].add(iperiod)
+                    else:
+                        bucket = values[spec.key]
+                        bucket[iperiod] = bucket.get(iperiod, 0.0) + sign * amount
+                        # 【has 只由加项设置】与 LK01 同一原则：
+                        #   若某行只有减项科目有记录、加项没有（数据异常），
+                        #   累加结果会是负数。此时不标记"有数据"，
+                        #   该格不写 —— 宁可不写，也不写一个负数误导人。
+                        if sign > 0:
+                            has[spec.key].add(iperiod)
+
+        # ---- 择一使用：主科目优先，整年无数据才降级 ----
+        #
+        # 【这里的判断顺序为什么是"主科目有无数据"？】
+        #   需求第 6 条：640101 未启用时用 6401 代替。
+        #   "未启用"在数据上的表现就是"整年查不到该科目的结转记录"。
+        #   所以：
+        #     · 主科目有任一月份记录 → 用主科目（哪怕只有 1 个月）
+        #     · 主科目整年都没有     → 用备用科目
+        #
+        #   【为什么不逐月判断？】
+        #     "科目是否存在"是账套级属性，不是月份级。
+        #     逐月降级会出现"1 月用 640101、2 月用 6401"的混用，
+        #     两段口径不同却拼在同一行，无法解释也无法核对。
+        #
+        #   【为什么主科目有 1 个月数据就完全不用备用科目？】
+        #     混用会让同一行的数字来自两个不同科目，
+        #     与"科目不存在才替代"的原始意图不符。
+        #     若某月主科目无记录，那是"该月未结转"，应留空 ——
+        #     宁可留空也不要用一级科目去补，否则会凭空多出金额。
+        self.row_fallback_used: dict[str, bool] = {}
+        for spec in ROW_SPECS:
+            main_ok = has.get(spec.key, set())
+            if main_ok or not spec.fallback_codes:
+                self.row_fallback_used[spec.key] = False
+                continue
+
+            fb_ok = fb_has.get(spec.key, set())
+            if not fb_ok:
+                # 主、备都没有数据 → 保持空白（原逻辑处理）
+                self.row_fallback_used[spec.key] = False
+                continue
+
+            # 主科目整年无数据、备用科目有数据 → 采用备用科目
+            values[spec.key] = fb_values[spec.key]
+            has[spec.key] = fb_ok
+            self.row_fallback_used[spec.key] = True
+
+            logger.warning(
+                "[%s] %s（第%d行）：主科目 %s 整年无结转记录，"
+                "已降级使用备用科目 %s。请核对：①该明细科目是否确实未启用；"
+                "②一级科目金额是否包含其他明细（如出口成本），避免重复。",
+                self.code, spec.label, spec.excel_row,
+                "、".join(spec.codes), "、".join(spec.fallback_codes),
+            )
 
         # ---- 收口保存 + 日志 ----
         self.row_values = values
