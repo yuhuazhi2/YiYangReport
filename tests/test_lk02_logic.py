@@ -376,7 +376,7 @@ class TestExportRevenue(unittest.TestCase):
         _, ctx = run_report([])
 
         # 找出所有 SUM(md) 的查询（收入组）
-        income_calls = [c for c in ctx.fetch_calls if "SUM(md)" in c["sql"]]
+        income_calls = [c for c in ctx.fetch_calls if "SUM(md) AS amount" in c["sql"]]
         self.assertEqual(
             len(income_calls), 1,
             f"所有收入行应合并在同一个 SUM(md) 查询里，"
@@ -528,10 +528,16 @@ class TestRowSpecs(unittest.TestCase):
                 f"不在 EXCEL_ROW 对照表中，可能手写错了行号")
 
     def test_direction_valid(self):
-        """direction 只能是 credit / debit。"""
+        """direction 只能是 debit / credit / signed。
+
+        【为什么允许 signed？】
+            有些科目（如 6117 其他收益）在结转时借贷两侧都可能出现，
+            必须同时取 SUM(md) 与 SUM(mc) 再按净额折算，
+            不能用单一方向。详见 ProfitRow 的 direction 说明。
+        """
         for spec in ROW_SPECS:
             self.assertIn(
-                spec.direction, ("credit", "debit"),
+                spec.direction, ("credit", "debit", "signed"),
                 f"「{spec.key}」的 direction={spec.direction!r} 非法")
 
     def test_codes_are_strings(self):
@@ -666,7 +672,7 @@ class TestDomesticRevenue(unittest.TestCase):
         _, ctx = run_report([])
 
         # 只看收入组（SUM(md)），因为成本行是另一组
-        income_calls = [c for c in ctx.fetch_calls if "SUM(md)" in c["sql"]]
+        income_calls = [c for c in ctx.fetch_calls if "SUM(md) AS amount" in c["sql"]]
         self.assertEqual(
             len(income_calls), 1,
             f"出口与内销口径相同，应在同一个收入组查询里，"
@@ -810,7 +816,7 @@ class TestOtherBusinessRevenue(unittest.TestCase):
         """
         _, ctx = run_report([])
 
-        income_calls = [c for c in ctx.fetch_calls if "SUM(md)" in c["sql"]]
+        income_calls = [c for c in ctx.fetch_calls if "SUM(md) AS amount" in c["sql"]]
         self.assertEqual(
             len(income_calls), 1,
             f"三个收入科目应合并为 1 条 SUM(md) 查询，"
@@ -959,10 +965,10 @@ class TestExportCost(unittest.TestCase):
         sqls = [c["sql"] for c in ctx.fetch_calls]
 
         self.assertTrue(
-            any("SUM(mc)" in s for s in sqls),
+            any("SUM(mc) AS amount" in s for s in sqls),
             f"应有一条 SQL 使用 SUM(mc)，实际：{sqls}")
         self.assertTrue(
-            any("SUM(md)" in s for s in sqls),
+            any("SUM(md) AS amount" in s for s in sqls),
             f"应有一条 SQL 使用 SUM(md)，实际：{sqls}")
 
     def test_direction_split_creates_two_queries(self):
@@ -983,10 +989,14 @@ class TestExportCost(unittest.TestCase):
         """
         _, ctx = run_report([])
 
+        # 【为什么现在是 3 次？】
+        #   需求第 11 条新增 6117 其他收益，direction="signed"，
+        #   它走独立取数函数（同时取 md 与 mc），与收入组/成本组都不同
+        #   → 共 3 组查询：debit / credit / signed。
         self.assertEqual(
-            len(ctx.fetch_calls), 2,
-            f"收入组(debit)与成本组(credit)方向不同，应各发 1 次、共 2 次查询，"
-            f"实际 {len(ctx.fetch_calls)} 次")
+            len(ctx.fetch_calls), 3,
+            f"收入组(debit)、成本组(credit)、方向不定组(signed) 各 1 次，"
+            f"共 3 次查询，实际 {len(ctx.fetch_calls)} 次")
 
     def test_excel_row_mapping_for_cost(self):
         """出口主营业务成本对应 Excel 第 14 行（行次 6）。
@@ -1241,7 +1251,7 @@ class TestTaxAndSellingExpense(unittest.TestCase):
         """所有成本费用行合并在同一次 SUM(mc) 查询。"""
         _, ctx = run_report([])
 
-        cost_calls = [c for c in ctx.fetch_calls if "SUM(mc)" in c["sql"]]
+        cost_calls = [c for c in ctx.fetch_calls if "SUM(mc) AS amount" in c["sql"]]
         self.assertEqual(
             len(cost_calls), 1,
             f"所有成本费用行应合并为 1 条 SUM(mc) 查询，"
@@ -1600,6 +1610,151 @@ class TestFinanceExpense(unittest.TestCase):
         self.assertTrue(approx(hook.get("E21"), 2600.0),
                         f"E21 应为 2600，实际 {hook.get('E21')}")
         self.assertTrue(approx(hook.get("E22"), 1800.0))
+
+
+class TestOtherIncome(unittest.TestCase):
+    """需求第 11 条：行次16「加：其他收益」（Excel 第 24 行）。
+
+    科目 6117，本表首个 direction="signed" 的行。
+
+    【本类的核心验证点：借贷两侧都要能取到，且符号正确】
+        6117 在结转时既可能出现在借方（收益增加）也可能出现在贷方
+        （收益冲回），现场确认"只能是唯一一个方向出现"。
+        若固定取 md 或 mc 单列，当它出现在另一侧时本行空白 —— 静默漏数。
+    """
+
+    def test_debit_side_positive(self):
+        """6117 出现在借方 → 正数（收益增加）。"""
+        hook, _ = run_report([("6117", 1, 500.0, 0.0)], month=1)
+
+        self.assertTrue(approx(hook.get("C24"), 500.0),
+                        f"C24（借方收益）应为 +500，实际 {hook.get('C24')}")
+        self.assertTrue(approx(hook.get("O24"), 500.0))
+
+    def test_credit_side_negative(self):
+        """6117 出现在贷方 → 负数（收益冲回，带负号填列）。
+
+        【为什么这条最关键？】
+            若实现成"固定取 md"，此场景取到 0，C24 空白 ——
+            报表上看不出异常，只是"本月没有其他收益"。
+            本条用贷方数据强制暴露该错误。
+        """
+        hook, _ = run_report([("6117", 1, 0.0, 300.0)], month=1)
+
+        self.assertTrue(approx(hook.get("C24"), -300.0),
+                        f"C24（贷方冲回）应为 -300，实际 {hook.get('C24')}")
+        self.assertTrue(approx(hook.get("O24"), -300.0))
+
+    def test_signed_net_when_both_sides(self):
+        """两侧同时有值时按净额填列（借方 - 贷方）。
+
+        【与现场口径的关系】
+            现场说"只能唯一一个方向出现"，正常情况不会两侧都有。
+            但若数据不遵守，仍按净额填列并打 WARNING（见 fetch），
+            而不是静默丢弃一侧。
+            本条给 500 / 200，期望净额 300。
+        """
+        hook, _ = run_report([("6117", 1, 500.0, 200.0)], month=1)
+
+        self.assertTrue(approx(hook.get("C24"), 300.0),
+                        f"C24（净额 500-200）应为 300，实际 {hook.get('C24')}")
+
+    def test_twelve_months_signed(self):
+        """12 个月正确；既有借方月也有贷方月时各自符号正确。
+
+        数据设计：奇数月借方 100、偶数月贷方 100
+            → 1月 +100, 2月 -100, 3月 +100, ...
+        累计 = 6*100 - 6*100 = 0
+        """
+        rows = []
+        for m in range(1, 13):
+            if m % 2 == 1:
+                rows.append(("6117", m, 100.0, 0.0))   # 借方
+            else:
+                rows.append(("6117", m, 0.0, 100.0))   # 贷方
+
+        hook, _ = run_report(rows, month=12)
+
+        for month, col in COL_OF_MONTH.items():
+            expect = 100.0 if month % 2 == 1 else -100.0
+            self.assertTrue(
+                approx(hook.get(f"{col}24"), expect),
+                f"{col}24（{month}月）应为 {expect}，"
+                f"实际 {hook.get(f'{col}24')}")
+
+        # 6 个 +100 与 6 个 -100 相抵
+        self.assertTrue(approx(hook.get("O24"), 0.0),
+                        f"O24 累计应为 0，实际 {hook.get('O24')}")
+
+    def test_direction_is_signed(self):
+        """配置层面固化：6117 必须是 signed 模式。"""
+        spec = next(s for s in ROW_SPECS if s.key == "其他收益")
+
+        self.assertEqual(spec.direction, "signed")
+        self.assertEqual(spec.codes, ("6117",))
+        self.assertEqual(spec.excel_row, EXCEL_ROW[16], "应写第 24 行")
+
+    def test_blank_when_no_data(self):
+        """无数据时整行空白（不写 0）。"""
+        hook, _ = run_report([], month=1)
+
+        for col in (*COL_OF_MONTH.values(), COL_YEAR_TOTAL):
+            self.assertIsNone(hook.get(f"{col}24"),
+                              f"{col}24 无数据时应空白，"
+                              f"实际 {hook.get(f'{col}24')}")
+
+    def test_uses_two_column_query(self):
+        """signed 模式必须走双列取数（SQL 含两个 SUM）。
+
+        【为什么要看 SQL 文本？】
+            若有人把 direction 误改成 debit/credit，
+            SQL 会变成单列 SUM，贷方月就取不到数。
+            本条直接断言 SQL 里有 SUM(md) AS debit_amount
+            与 SUM(mc) AS credit_amount 两个别名。
+        """
+        _, ctx = run_report([])
+
+        signed_calls = [
+            c for c in ctx.fetch_calls
+            if "debit_amount" in c["sql"] and "credit_amount" in c["sql"]
+        ]
+        self.assertEqual(
+            len(signed_calls), 1,
+            f"应恰有 1 条双列取数（signed 模式），"
+            f"实际 {len(signed_calls)} 条")
+
+        params = signed_calls[0]["params"]
+        self.assertIn("6117", params)
+        self.assertIn("4103", params)
+
+    def test_not_crossed_with_finance_expense(self):
+        """其他收益(24)不与财务费用(21)串用。"""
+        rows = [
+            ("6117", 3, 500.0, 0.0),      # 其他收益
+            ("6603", 3, 2600.0, 0.0),     # 财务费用（模拟，正常应是 mc）
+        ]
+        hook, _ = run_report(rows, month=3)
+
+        self.assertTrue(approx(hook.get("E24"), 500.0),
+                        f"E24（其他收益）应为 500，实际 {hook.get('E24')}")
+        # 财务费用行不应受 6117 影响
+        self.assertNotEqual(hook.get("E21"), 500.0,
+                            "财务费用不应被其他收益的数污染")
+
+    def test_excel_row_mapping(self):
+        """行次 16 → Excel 第 24 行。
+
+        【为什么单独断言？】
+            EXCEL_ROW 里第 16 行对应 24：
+                行次 15 = 23（利息收入）
+                行次 16 = 24（其他收益）
+                行次 17 = 25（投资收益）
+            容易误写成 23 或 25。
+        """
+        self.assertEqual(EXCEL_ROW[16], 24)
+
+
+
 
 
 class TestTemplateConsistency(unittest.TestCase):

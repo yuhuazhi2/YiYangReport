@@ -525,6 +525,85 @@ def gl_profit_amount_by_period(
     return sql, params
 
 
+def gl_profit_signed_amount(
+    year: int,
+    codes: tuple[str, ...],
+    *,
+    digest_keywords: tuple[str, ...] = (),
+    equal_codes: tuple[str, ...] = (),
+) -> tuple[str, list]:
+    """利润表取数：借贷两侧都返回，由报表层按"借方为负"折算成带符号净额。
+
+    【与 gl_profit_amount_by_period 的区别（务必分清）】
+        那个函数按 amount_side 只 SUM 一列，用于"方向恒定"的行：
+            收入行永远在借方、成本行永远在贷方。
+        本函数同时 SUM(md) 与 SUM(mc)，用于"方向不定"的行：
+            某些科目（如 6117 其他收益）在月底结转损益时，
+            既可能记借方（收益增加）也可能记贷方（收益冲回），
+            但**同一个月只会出现在一侧**。
+
+    【需求现场口径（LK02 行次16 其他收益 6117，20261104 确认）】
+        ① 年度/期间匹配：iYPeriod 在 [YYYY01, YYYY12]
+        ② ccode = 6117
+        ③ cdigest 含「损益结转」「结转损益」「自动结转损益」
+        ④ ccode_equal = 4103（本年利润）
+        ⑤ 取 md 或 mc 的值（借贷两侧，唯一一侧有值）
+        ⑥ **若出现在借方 → 按常规填列（正数）
+             若出现在贷方 → 用负号填列**
+
+    【为什么"借方为正、贷方为负"？】
+        报表上"其他收益"是收益类项目，正数表示收益增加。
+        结转损益时：
+            · 收益增加 → 借 其他收益 / 贷 本年利润  → 金额在借方 md
+            · 收益冲回 → 借 本年利润 / 贷 其他收益  → 金额在贷方 mc
+        所以借方对应"正收益"、贷方对应"负收益（冲减）"，
+        折算公式即：**净额 = SUM(md) - SUM(mc)**。
+
+    【为什么不在 SQL 里直接算 md - mc？】
+        两列都带回来，报表层可以：
+          · 在日志里分别列出借方合计与贷方合计，
+            便于财务核对"这笔是收益还是冲回"；
+          · 若某月两列同时有值（违反现场"唯一一侧"的说法），
+            能在日志里显式告警，而不是静默相减得出一个看似正常的数。
+
+    【返回】
+        [(ccode, iperiod, debit_amount, credit_amount), ...]
+        按 (iperiod, ccode) 排序。两列都是 SUM 结果（无记录时为 NULL）。
+    """
+    if not codes:
+        raise ValueError("codes 不能为空：利润表每行至少应指定一个科目")
+
+    yperiod_begin = int(f"{year}01")
+    yperiod_end = int(f"{year}12")
+
+    where: list[str] = [
+        "iyear = ?",
+        "iYPeriod BETWEEN ? AND ?",
+        f"ccode IN ({_placeholders(len(codes))})",
+    ]
+    params: list[Any] = [int(year), yperiod_begin, yperiod_end, *codes]
+
+    if digest_keywords:
+        or_clause = " OR ".join("cdigest LIKE ?" for _ in digest_keywords)
+        where.append(f"({or_clause})")
+        params.extend(f"%{kw}%" for kw in digest_keywords)
+
+    if equal_codes:
+        where.append(f"ccode_equal IN ({_placeholders(len(equal_codes))})")
+        params.extend(equal_codes)
+
+    sql = f"""
+        SELECT ccode, iperiod,
+               SUM(md) AS debit_amount,
+               SUM(mc) AS credit_amount
+        FROM GL_accvouch
+        WHERE {' AND '.join(where)}
+        GROUP BY ccode, iperiod
+        ORDER BY iperiod, ccode
+    """
+    return sql, params
+
+
 # ---------------------------------------------------------------------------
 # 四、往来类（应收/应付）
 # ---------------------------------------------------------------------------
