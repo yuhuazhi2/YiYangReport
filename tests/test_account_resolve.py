@@ -210,10 +210,41 @@ class TestBetweenYears(unittest.TestCase):
         self.assertEqual(target.prev_database, "UFDATA_001_2015")
 
     def test_after_last_record(self):
-        """查 2020：大于最大记录 2018 → 本年=C，前一年也是 C。"""
+        """查 2020：大于最大记录 2018 → 本年=C，前一年也是 C。
+
+        【20261105 现场确认：此种情形取"最大那条"，不报错】
+            含义：查询年度比该账套全部登记的 iBeginYear 都大，
+            说明 2018 之后没有更新的登记记录。程序按"该库仍在延用"处理，
+            连上最后登记的那个库（C）。
+
+            为什么选择"取最大那条"而不是报错？
+                该库可能确实一直在用 —— 账套停用后登记没清理、
+                或系统升级后沿用旧库，都是现场常见情况。
+                若报错会挡住这些正常场景。
+
+            代价（须知）：若账套真的在 2018 年后停用，
+                用户查 2020 会连上 C 库、取到空数据、报表填出一堆 0。
+                此时**年度是否有数据由用户自行核对**，程序不做拦截。
+
+            这条测试锁定该行为。若日后有人改为"报错"或"取别的记录"，
+            本条会立刻失败，提醒他先回顾这个取舍。
+        """
         target, _ = resolve(self.rows, year=2020)
-        self.assertEqual(target.database, "UFDATA_001_2018")
+        self.assertEqual(target.database, "UFDATA_001_2018",
+                         "大于最大起始年度时应取最后登记的那条（现场确认）")
         self.assertEqual(target.prev_database, "UFDATA_001_2018")
+
+    def test_single_record_future_year(self):
+        """单条记录 + 查询未来年份（如 2013 建账、查 2030）→ 仍用该唯一库。
+
+        【与"大于最大"同理】
+            单库形态下，起始年之后的所有年度都在这一个库里，
+            包括比当前更晚的年份（账套会一直用下去）。
+        """
+        target, _ = resolve([("UFDATA_001", 2013, None)], year=2030)
+        self.assertEqual(target.database, "UFDATA_001")
+        self.assertEqual(target.prev_database, "UFDATA_001")
+        self.assertEqual(target.prev_year, 2029)
 
     def test_before_first_record_raises(self):
         """查 2012（早于最小 2013）→ 报错。"""
