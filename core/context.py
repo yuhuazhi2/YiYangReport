@@ -123,13 +123,18 @@ class ReportContext:
     """
 
     def __init__(self, db: Database, period: Period, account_set: str = "001",
-                 target_database: str = ""):
+                 target_database: str = "", prev_database: str = ""):
         """
         参数：
             db              : 已连接的 Database 对象。
             period          : 会计期间（Period）。
             account_set     : 账套号，默认 "001"。
             target_database : 本次取数的年度库（如 UFDATA_001_2026）。
+            prev_database   : **上一年度**所在的业务库。
+                              仅当部分报表需要"上年同期数"时才用得到
+                              （如 LK02 利润表的"上年同期累计数"）。
+                              与 target_database 可能相同（跨年度单库），
+                              也可能不同（分年度多库）；空串表示"无上年数据"。
 
         【新手必学：为什么上下文必须知道"目标库"？】
             生成流程开始前，core/u8_account.py 已按"账套号 + 年度"
@@ -143,12 +148,22 @@ class ReportContext:
 
             所以让上下文持有 target_database，并在每一次查询时显式指定它。
             "每一次都写明白查哪个库"，不依赖任何隐式状态 —— 这比"碰巧对"可靠。
+
+        【为什么上一年度库要单独记？】
+            U8 有两种存储架构（详见 core/u8_account.py 的说明）：
+              · 跨年度单库：本年与上年数据在**同一个**物理库 → 两者相同；
+              · 分年度多库：每年一个独立库 → 两者不同。
+            报表层不该自己判断架构，只需向上下文问"上年同期该查哪个库"，
+            由解析器统一给出答案。这样报表代码永远是同一份写法。
         """
         self.db = db
         self.period = period
         self.account_set = account_set
         # 本次生成固定使用的年度库；空字符串表示"不指定（沿用连接当前库）"。
         self.target_database = target_database
+        # 上一年度库；与 target_database 相同时表示"跨年度单库"。
+        # 空字符串表示"该账套首年，没有上年数据"。
+        self.prev_database = prev_database
 
         # _cache：真正的取数缓存。键是字符串，值是查询结果（行列表）。
         self._cache: dict[str, Any] = {}

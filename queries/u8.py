@@ -43,7 +43,11 @@
     - 期间参数统一用 (iyear, iperiod)，即"会计年、会计期间(月)"
     - 注意区分两种库：
         数据字典库 UFSystem    —— 存账套信息、用户、权限等系统级数据
-        年度库     UFDATA_xxx_yyyy —— 每个账套每年一个库，业务数据都在这里
+        业务数据库             —— 业务数据都在这里，有两种命名形态：
+              UFDATA_001_2026   分年度多库模式（老架构，每年一个独立库）
+              UFDATA_001        跨年度单库模式（U8 推荐，起始年至今共用一个库）
+        到底属于哪种，必须查 UFSystem.dbo.UA_AccountDatabase 才能确定，
+        不能靠库名长相去猜。详见下方 account_databases() 的说明。
 """
 from __future__ import annotations
 
@@ -789,64 +793,81 @@ def salary_data(year: int, month: int, wa_class: str = "") -> tuple[str, list]:
 # ---------------------------------------------------------------------------
 # 八、账套注册信息（系统库 UFSystem）—— 决定"该连哪个年度库"
 # ---------------------------------------------------------------------------
-def account_database(system_database: str, acc_id: str, year: int) -> tuple[str, list]:
-    """查询"某账套在某年度"对应的年度库名（如 UFDATA_001_2026）。
+def account_databases(system_database: str, acc_id: str) -> tuple[str, list]:
+    """查询某账套在 UA_AccountDatabase 中的**全部**登记记录。
 
     【这张表是什么？】
         用友把"有哪些账套、每个账套有哪几年的库"登记在系统库
         UFSystem 的 UA_AccountDatabase 表里。这是**权威来源**：
-        年度库叫什么名字，必须问它，不能靠人猜、更不能靠客户手填。
+        业务库叫什么名字，必须问它，不能靠人猜、更不能靠客户手填。
 
     【关键字段】
         cAcc_Id     账套号（如 "001"），对应界面上的"账套号"
-        cDatabase   年度库名（如 "UFDATA_001_2026"）—— 我们要的就是它
-        iBeginYear  该年度库覆盖的开始年度
-        iEndYear    该年度库覆盖的结束年度；**可能是 NULL**
+        cDatabase   业务库名 —— 我们要的就是它
+        iBeginYear  该记录的起始年度（**这是判断归属的核心字段**）
+        iEndYear    结束年度。**本项目的判定逻辑不依赖它**，仅随行返回备查
 
-    【匹配规则（现场确定的业务口径，不要随意改动）】
-        条件一：cAcc_Id 等于操作人选的账套号
-        条件二：满足下面任意一条
-            a) 选的年度在 iBeginYear 与 iEndYear 之间（含两端）
-            b) iEndYear 为 NULL，且选的年度正好等于 iBeginYear
+    【★ 为什么"返回全部记录"而不是"按年度过滤出一条"？★】
+        因为调用方要回答的是**两个问题**，不是一个：
+            ① 查询年度（如 2026）的数据在哪个库？
+            ② **前一年**（如 2025）的数据在哪个库？
+               —— 部分报表需要与上一年同期对比（如 LK02 利润表的
+                  "上年同期累计数"），必须知道前一年该连哪个库。
 
-    【新手难点：为什么 (b) 里只用 = 而不是 >=？】
-        按现场给的口径：iEndYear 为 NULL 时，这条记录**只代表开始那一年**，
-        而不是"从开始年度一直有效"。这是用友数据本身的约定，
-        我们必须照着它判断，否则可能把 2026 年的账错当成 2030 年的。
+        而这两个答案之间存在"可能同库、也可能不同库"的关系，
+        只有把该账套的全部登记记录一次性取回来，
+        才能按 iBeginYear 的排序与相邻关系推导出两个库名。
+
+        若仍按"查询年度"在 SQL 里过滤，就只能拿到一条，
+        前一年库无从判断 —— 那会逼着上层再发一次查询，
+        且两次查询之间源数据若有变动，还会出现不一致。
+
+    【两种存储架构与记录形态（现场确认）】
+        ① 跨年度单库模式（U8 推荐、常见）
+              该账套**只有一条**记录，如：
+                  iBeginYear = 2013（iEndYear 可能为 NULL 或某个年份）
+              含义：2013 年起的全部年度数据都在同一个物理库里。
+              此时查询 2026 年、以及 2025 年，都用这**同一个库**。
+
+        ② 分年度多库模式（老架构 / 特定场景）
+              该账套**有多条**记录，如：
+                  iBeginYear = 2013 → UFDATA_001_2013
+                  iBeginYear = 2014 → UFDATA_001_2014
+                  iBeginYear = 2015 → UFDATA_001_2015
+              含义：每个年度一个独立物理库。
+              此时 2026 年若落在 2015 那条之后（无 2026 专属记录），
+              归属 2015 那条；2025 同理。
+
+        ⚠ 注意区分：**记录条数**决定走哪种推导分支，
+           而不是 iEndYear 是否为 NULL。
+           最初我按 iEndYear 判断（以为 NULL 表示"仅该年度"），
+           方向完全错了，已按现场口径改正。
+
+    【排序：iBeginYear 升序】
+        上层要靠"相邻两条记录"来推导归属，因此这里必须按
+        iBeginYear 升序排好返回，让上层可以直接顺序扫描，
+        不必自己再排一次（避免两处排序规则不一致）。
+
+        同一年度若有多条（历史遗留脏数据），按 cDatabase 排序，
+        保证结果稳定可复现，便于排查。
 
     【新手必学：为什么库名要拼进 SQL，而不是用 ? 占位符？】
         因为 [UFSystem] 是"库名/表名"，属于标识符；
-        占位符 ? 只能放"值"（如账套号、年度），不能放标识符。
-        所以库名用 quote_ident 安全包裹后拼接，而**账套号与年度仍走 ?**，
+        占位符 ? 只能放"值"（如账套号），不能放标识符。
+        所以库名用 quote_ident 安全包裹后拼接，而**账套号仍走 ?**，
         这样既满足语法要求，又杜绝了注入风险。
-
-    【新手必学：(a) 与 (b) 用 OR 连接，外面套一层括号】
-        WHERE cAcc_Id = ?
-          AND ( (年度区间判断) OR (NULL 特例判断) )
-        如果不加外层括号，SQL 的 AND 优先级高于 OR，
-        就会变成 "A AND B OR C"，与我们的本意完全不同 —— 这是极常见的错误。
     """
     # 延迟导入：避免 queries 与 core 之间产生循环导入
     from core.db import quote_ident
 
     sysdb = quote_ident(system_database)
-    # 【新手须知：为什么把 iBeginYear / iEndYear 也一起查出来？】
-    #   它们不影响"取哪个库"的判断（那是 WHERE 的事），
-    #   但带回上层后，可以写进日志："账套 001 的 2026 年 → UFDATA_001_2026
-    #   （覆盖 2026~2026）"。日后核对"为什么查的是这个库"时，
-    #   这行日志就是最直接的证据。
     sql = f"""
         SELECT cDatabase, iBeginYear, iEndYear
         FROM {sysdb}.dbo.UA_AccountDatabase
         WHERE cAcc_Id = ?
-          AND (
-                (iEndYear IS NOT NULL AND ? BETWEEN iBeginYear AND iEndYear)
-             OR (iEndYear IS NULL AND ? = iBeginYear)
-          )
-        ORDER BY iBeginYear DESC
+        ORDER BY iBeginYear ASC, cDatabase ASC
     """
-    # 三个 ? 依次是：账套号、年度（区间判断）、年度（NULL 特例判断）
-    return sql, [acc_id, year, year]
+    return sql, [acc_id]
 
 
 def list_accounts(system_database: str) -> tuple[str, list]:

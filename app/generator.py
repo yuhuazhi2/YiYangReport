@@ -178,6 +178,7 @@ class ReportGenerator:
         #   各报表查的可能是**别的账套/别的年度**的数据 —— 而且不会报错，
         #   只会安安静静输出一份错账。所以：解析不出来，就绝不往下生成。
         target_db = ""
+        prev_db = ""
         if connected:
             try:
                 target = resolve_account_database(
@@ -187,6 +188,7 @@ class ReportGenerator:
                     system_database=self.config.connection.system_database or "UFSystem",
                 )
                 target_db = target.database
+                prev_db = target.prev_database or ""
                 # 记到配置里，界面与日志就能显示"本次用的是哪个库"
                 self.config.connection.target_database = target_db
                 # 【为什么进度文字里不写库名？】
@@ -196,9 +198,19 @@ class ReportGenerator:
                 #   这句话正好把这两点说清楚，让他们对数据来源放心。
                 #   （真正的库名已由上面那行 logger 记进 logs/app.log，
                 #     维护者排错时能看到，客户看不到。）
+                #
+                # 【关于上年同期库的提示】
+                #   仅当"有上年数据、且上年库与本年库不同"时，才多提一句。
+                #   若两者相同（跨年度单库），客户无须知道——多说反而疑惑。
+                hint = ""
+                if target.has_prev:
+                    if prev_db and prev_db != target_db:
+                        hint = f"，上年数据取自 {prev_db}"
+                else:
+                    hint = "（该账套为首年，无上年数据）"
                 self._report(
                     0, 1, "",
-                    f"已确认数据源：账套 {target.account_set} / {target.year} 年",
+                    f"已确认数据源：账套 {target.account_set} / {target.year} 年{hint}",
                 )
             except AccountResolveError as exc:
                 # 【关键设计：失败就停，不生成半成品】
@@ -211,9 +223,11 @@ class ReportGenerator:
                 return result
 
         # 上下文：贯穿本次生成，负责缓存与审计（详见 core/context.py）
-        # 把 target_db 传进去：之后 43 张报表的每一次取数都会显式打这个库。
+        # 把 target_db / prev_db 传进去：之后 43 张报表的每一次取数都会
+        # 显式打这两个库（本年用前者，需要上年同期数的行用后者）。
         ctx = ReportContext(db, period, self.config.account_set,
-                            target_database=target_db)
+                            target_database=target_db,
+                            prev_database=prev_db)
 
         # ===== 第3步：加载内置报表模块 =====
         # 【新手难点】这行只是在"import 模块"，但它会触发各报表类上的
