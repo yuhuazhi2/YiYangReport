@@ -126,9 +126,11 @@ class TestSignedRowsTogether(unittest.TestCase):
         """三行口径相同，应合并为 1 条双列查询。"""
         _, ctx = run_report([])
 
+        # 【只统计本年】20261106 起会额外查一次上年（SQL 结构相同）
         signed_calls = [
             c for c in ctx.fetch_calls
-            if "debit_amount" in c["sql"] and "credit_amount" in c["sql"]
+            if not c["report_code"].endswith("-上年")
+            and "debit_amount" in c["sql"] and "credit_amount" in c["sql"]
         ]
         self.assertEqual(
             len(signed_calls), 1,

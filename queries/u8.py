@@ -373,6 +373,7 @@ def gl_profit_amount_by_period(
     digest_keywords: tuple[str, ...] = (),
     equal_codes: tuple[str, ...] = (),
     booked_only: bool = False,
+    end_month: int = 12,
 ) -> tuple[str, list]:
     """利润表取数：按期间汇总某批科目的**发生额**（取自 GL_accvouch）。
 
@@ -385,8 +386,10 @@ def gl_profit_amount_by_period(
 
     【需求现场口径（LK02 行次2 出口主营业务收入，20261102 确认）】
         同时满足以下条件：
-          ① 年度/期间匹配：iYPeriod 落在 [YYYY01, YYYY12] 区间内，
+          ① 年度/期间匹配：iYPeriod 落在 [YYYY01, YYYY{end_month}] 区间内，
              其中 YYYYMM 形如 202601（= 2026年1月）
+             【20261106 口径变更】区间上限不再是固定 12 月，而是
+             end_month（= 操作人选定的月份）。选 5 月就只取 1~5 月。
           ② ccode = 指定科目（本行为 600102）
           ③ cdigest 包含「损益结转」「结转损益」「自动结转损益」之一
           ④ ccode_equal（对方科目）= 4103（本年利润）
@@ -398,8 +401,8 @@ def gl_profit_amount_by_period(
                 iperiod  = 1
                 iYPeriod = 202601     ← 字典漏列，但真实存在
             三者语义等价，但 iYPeriod 把年与月合成一个整数：
-              · 单字段范围过滤 [YYYY01, YYYY12]，一次覆盖全年 12 个月；
-              · 不必写 "iyear=2026 AND iperiod BETWEEN 1 AND 12" 两个条件；
+              · 单字段范围过滤 [YYYY01, YYYYMM]，一次覆盖所需月份；
+              · 不必写 "iyear=2026 AND iperiod BETWEEN 1 AND N" 两个条件；
               · 与用友前台"按年月查询"的习惯一致，便于与财务核对。
 
             【仍然保留 iyear = ? 作为冗余保险】
@@ -431,7 +434,15 @@ def gl_profit_amount_by_period(
 
     【参数】
         year             会计年度：用于 iyear 过滤，并据此生成
-                         iYPeriod 区间 [YYYY01, YYYY12]
+                         iYPeriod 区间 [YYYY01, YYYY{end_month}]
+        end_month        取数截止月份（1~12，默认 12）。
+                         【20261106 新增，口径变更】LK02 需求要求：
+                         选 2026年5月 → 只取 1~5 月，6~12 月不取。
+                         原先"超出所选期间也照常取回"的旧口径作废 ——
+                         理由：利润表是按期出具的报告，把未来月份的数
+                         提前填进来，会让"本月报表"看起来像全年报表。
+                         【注意】这不是"数据截断"：1~end_month 之间若
+                         某月缺结转，仍照常留空，不做补 0。
         codes            科目编码集合（精确匹配，可多个）
         amount_side      "debit" → SUM(md)（收入行用）
                          "credit" → SUM(mc)（成本费用行用）
@@ -476,12 +487,18 @@ def gl_profit_amount_by_period(
     if not codes:
         raise ValueError("codes 不能为空：利润表每行至少应指定一个科目")
 
-    # iYPeriod 是"年月整数"，如 2026 年 → 202601 ~ 202612。
-    # 【为什么用区间而不是 IN (12 个值)？】
+    # iYPeriod 是"年月整数"，如 2026 年 1~5 月 → 202601 ~ 202605。
+    # 【为什么用区间而不是 IN (若干值)？】
     #   区间写法更短、可读，且 SQL Server 对 BETWEEN 能直接用索引；
-    #   若写成 IN (202601, ..., 202612) 也能跑，但条件串长且易漏。
+    #   若写成 IN (202601, ..., 202605) 也能跑，但条件串长且易漏。
+    # 【end_month 必须校验】越界会在 SQL 里拼出 202613 这类不存在的
+    #   年月，取数结果为空 —— 报表全空白却不报错，只能靠人发现。
+    if not 1 <= int(end_month) <= 12:
+        raise ValueError(
+            f"end_month 必须在 1~12 之间，收到 {end_month!r}"
+        )
     yperiod_begin = int(f"{year}01")
-    yperiod_end = int(f"{year}12")
+    yperiod_end = int(f"{year}{int(end_month):02d}")
 
     where: list[str] = [
         "iyear = ?",
@@ -535,6 +552,7 @@ def gl_profit_signed_amount(
     *,
     digest_keywords: tuple[str, ...] = (),
     equal_codes: tuple[str, ...] = (),
+    end_month: int = 12,
 ) -> tuple[str, list]:
     """利润表取数：借贷两侧都返回，由报表层按"借方为负"折算成带符号净额。
 
@@ -547,7 +565,8 @@ def gl_profit_signed_amount(
             但**同一个月只会出现在一侧**。
 
     【需求现场口径（LK02 行次16 其他收益 6117，20261104 确认）】
-        ① 年度/期间匹配：iYPeriod 在 [YYYY01, YYYY12]
+        ① 年度/期间匹配：iYPeriod 在 [YYYY01, YYYY{end_month}]
+           （20261106 口径变更：上限取操作人选定的月份，不再固定 12 月）
         ② ccode = 6117
         ③ cdigest 含「损益结转」「结转损益」「自动结转损益」
         ④ ccode_equal = 4103（本年利润）
@@ -577,8 +596,13 @@ def gl_profit_signed_amount(
     if not codes:
         raise ValueError("codes 不能为空：利润表每行至少应指定一个科目")
 
+    # 与 gl_profit_amount_by_period 保持完全一致的月份上限口径
+    if not 1 <= int(end_month) <= 12:
+        raise ValueError(
+            f"end_month 必须在 1~12 之间，收到 {end_month!r}"
+        )
     yperiod_begin = int(f"{year}01")
-    yperiod_end = int(f"{year}12")
+    yperiod_end = int(f"{year}{int(end_month):02d}")
 
     where: list[str] = [
         "iyear = ?",

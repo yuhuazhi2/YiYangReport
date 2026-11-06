@@ -83,6 +83,11 @@ class GenerateResult:
     output_path: Optional[Path] = None
     generated_codes: list[str] = field(default_factory=list)
     failed: dict[str, str] = field(default_factory=dict)  # code -> 错误信息
+    # 附加说明（如"上年对比页已隐藏，按 Ctrl+Shift+H 切换"）。
+    # 【为什么要单独一个列表，不并进 message？】
+    #   message 是给人看的一句话结论，塞太多细节会变得难读；
+    #   这些说明逐条列出来更清楚，界面可以按行展示。
+    notes: list[str] = field(default_factory=list)
     elapsed: float = 0.0
     message: str = ""
     audit_summary: str = ""
@@ -268,6 +273,9 @@ class ReportGenerator:
                         hook = engine.sheet(rep.code)   # 拿到该页的写入句柄
                         rep.generate(hook, ctx)          # 取数→填表→核对登记
                         result.generated_codes.append(rep.code)
+
+                        # ---- 6.1 上年对比页（仅当报表声明了该能力）----
+                        self._make_prev_sheet(engine, rep, ctx, result)
                     except Exception as exc:
                         # 【关键设计：单表失败不影响其他表】
                         #   记录错误、跳过本张、继续下一张。
@@ -318,3 +326,67 @@ class ReportGenerator:
         result.audit_summary = ctx.audit_summary()
         logger.info("生成结束：%s，耗时 %.2fs", result.message, result.elapsed)
         return result
+
+    # ------------------------------------------------------------------
+    # 上年对比页
+    # ------------------------------------------------------------------
+    def _make_prev_sheet(self, engine: ExcelEngine, rep,
+                         ctx: ReportContext,
+                         result: GenerateResult) -> None:
+        """为声明了 prev_sheet_suffix 的报表制作"上年对比页"。
+
+        【什么时候做？】
+            只要报表类声明了 prev_sheet_suffix（如利润表 = "(上年)"）就做。
+            **即使上年无数据也生成** —— 这一点曾经做错过，见下方说明。
+
+        【做了什么？】
+            ① 复制本年页 → 命名为 "<代码><后缀>"，紧跟在本年页之后；
+            ② 用上年数据填这张页（C4 写上年年月，不填 P 列）；
+            ③ 设为隐藏，避免财务误改；
+            ④ 注册快捷键 Ctrl+Shift+H 切换显示/隐藏。
+
+        【为什么整段用 try 包住、失败只记日志？】
+            上年对比页是"附加信息"。它坏了不该让本年表也报错 ——
+            本年表的数据已经正确写进 Excel 了，用户拿到的主报表是完整的。
+            若这里抛出异常，会被外层当成"LK02 生成失败"，
+            结果本年表也被标记为失败，反而制造恐慌。
+        """
+        suffix = getattr(rep, "prev_sheet_suffix", "") or ""
+        if not suffix:
+            return
+
+        # 【★ 即使"上年无数据"也要生成这张页 ★】
+        #
+        # 早期实现是"无数据就跳过"，理由是不想给用户一张空白页。
+        # 但实际使用后发现问题：维护者分不清两种情况 ——
+        #   · 功能没生效（页根本没生成）
+        #   · 上年确实没数据（页生成了但是空的）
+        # 而这两者的处理方式完全不同：前者要查程序，后者要查 U8 账。
+        #
+        # 所以改为：**总是生成**，并在页面上明确标注"上年同期无数据"。
+        # 一张标注清楚的空页 = "程序查过了，确实没有" 的证据。
+        has_prev = bool(getattr(rep, "has_prev_data", False))
+        if not has_prev:
+            logger.info(
+                "[%s] 上年同期未取到数据，仍生成空白对比页供核查"
+                "（页内会标注「上年同期无数据」）。", rep.code)
+
+        prev_name = f"{rep.code}{suffix}"
+        try:
+            prev_hook = engine.copy_sheet(rep.code, prev_name)
+            rep.generate_prev_sheet(prev_hook, ctx)
+            engine.set_sheet_visible(prev_name, False)
+
+            ok = engine.register_toggle_hotkey(prev_name)
+            if ok:
+                result.notes.append(
+                    f"{prev_name}：已生成并隐藏，按 Ctrl+Shift+H 显示/隐藏")
+            else:
+                result.notes.append(
+                    f"{prev_name}：已生成并隐藏（快捷键注册失败，"
+                    f"可在 Excel 中右键页签→取消隐藏）")
+            logger.info("[%s] 上年对比页已生成：%s（隐藏）", rep.code, prev_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("[%s] 上年对比页生成失败（不影响本年表）：%s",
+                           rep.code, exc)
+            result.notes.append(f"{prev_name}：生成失败（{_brief_error(exc)}）")

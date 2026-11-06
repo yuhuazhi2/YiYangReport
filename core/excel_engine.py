@@ -426,12 +426,333 @@ class ExcelEngine:
             if sh.Name not in keep_names:
                 to_delete.append(sh.Name)
 
+        # 3.5) 删除之前，先固化"引用了即将被删表页"的公式
+        #      （必须做，否则 A2/A4 等页眉会变成 #REF!，详见方法注释）
+        if to_delete:
+            frozen = self._freeze_cross_sheet_formulas(
+                keep_names, set(to_delete))
+            if frozen:
+                logger.info("已固化 %d 个跨表引用公式（避免删表后变 #REF!）",
+                            frozen)
+
         # 4) 从后往前删除，避免索引错位
         for name in reversed(to_delete):
             self._wb.Sheets(name).Delete()
 
+        # 5) 删表后兜一道：把变成 #REF! 的页眉格子恢复成模板原文
+        #
+        # 【为什么必须做（真实故障 20261106）】
+        #   生成的 LK02 里 A2「公司名称:」、A4「会计期间：」显示 #REF!。
+        #   模板这两格是公式（xlrd 读到缓存值所以看着像文本），
+        #   删表后引用断裂 → Excel 算成 #REF!。
+        #
+        #   危害不止"难看"：fill_common_header 按内容搜索定位，
+        #   断链后读到错误码 23 而非"公司名称"，永远找不到该写哪格，
+        #   页眉从此再也填不进去，且不报任何错。
+        self._restore_broken_header_cells(keep_names)
+
         logger.info("已保留 %d 张报表页，删除 %d 张", len(kept_codes), len(to_delete))
         return kept_codes
+
+    # Excel 常量：SpecialCells 只选含公式的单元格
+    _XL_CELL_TYPE_FORMULAS = -4123
+
+    def _freeze_cross_sheet_formulas(self, keep_names: set,
+                                     deleted: set) -> int:
+        """把"引用了即将被删表页"的公式，替换成它当前的缓存值。
+
+        返回：实际固化的单元格个数。
+
+        【为什么必须做（真实故障 20261106）】
+            生成的 LK02 中 A2「公司名称:」、A4「会计期间：」显示 #REF!。
+            模板里这两格其实是跨表引用公式（如 =报表封面!B2），
+            xlrd 读到的是缓存值，所以"看起来像文本"。
+
+            keep_only() 删掉未选表页后引用链断裂 → 变成 #REF!。
+            更严重的是：断链后这两个格子再也不能按内容定位 ——
+            fill_common_header 靠"搜索含『公司名称』的格子"决定写哪，
+            断链后读到的是错误码 23，永远搜不到，页眉永远填不进去。
+
+            证据：生成文件 A2 的单元格类型是 ERROR(5)。纯文本写入
+            绝不可能产生 ERROR 类型，只有公式求值失败才会。
+
+        【为什么只固化跨表的】
+            本页公式（如利润表 30/33/35 行的 =SUM(...)）与删表无关，
+            是报表的计算核心，必须原样保留。若一刀切全转成值，
+            那些公式会变成死数 —— 比 #REF! 更危险，因为看不出异常。
+
+        【为什么还要判断引用目标是否真被删】
+            跨表引用也可能指向仍保留的表（如 LK02 引用 LK01），
+            那种引用删表后依然有效，固化它只是白丢联动性。
+        """
+        import re
+
+        # 匹配 'Sheet Name'!A1 或 SheetName!A1（表名含空格时 Excel 加引号）
+        ref_re = re.compile(r"(?:'([^']+)'|([^\s'!()=+\-*/,&<>]+))!")
+
+        total = 0
+        for name in keep_names:
+            try:
+                ws = self._wb.Sheets(name)
+                rng = ws.UsedRange.SpecialCells(self._XL_CELL_TYPE_FORMULAS)
+                count = int(rng.Count)
+            except Exception:
+                # 该页不存在或没有任何公式：正常，跳过
+                continue
+
+            for idx in range(1, count + 1):
+                try:
+                    cell = rng.Item(idx)
+                    formula = str(cell.Formula or "")
+                    if "!" not in formula:
+                        continue
+                    targets = set()
+                    for m in ref_re.finditer(formula):
+                        t = (m.group(1) or m.group(2) or "").strip()
+                        if t:
+                            targets.add(t)
+                    if not (targets & deleted):
+                        continue
+                    # .Value = .Value：用当前缓存值覆盖公式本身
+                    cell.Value = cell.Value
+                    total += 1
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("固化公式失败（%s 第 %d 个）：%s",
+                                   name, idx, exc)
+        return total
+
+    # ------------------------------------------------------------------
+    # 表页复制与显示/隐藏（20261106 新增，为上年对比页服务）
+    # ------------------------------------------------------------------
+    def copy_sheet(self, code: str, new_name: str) -> "_SheetHook":
+        """完整复制某个报表页，命名为 new_name，返回其句柄。
+
+        【为什么用 Copy 而不是逐格复制】
+            利润表版式很重：合并单元格、列宽、行高、边框、数字格式、
+            公式、打印区域。逐格复制必漏其中若干项，
+            复制页会"看着像但处处不对"，且很难逐项核对。
+
+        【为什么先记 Index 再复制】
+            Copy(After=src) 后各页 Index 会变，而 .Next 在 src 是
+            最后一页时容易误判。记下复制前位置、复制后取下一张最直白。
+        """
+        self._ensure_open()
+        src_name = self._code_to_name.get(_normalize_code(code))
+        if not src_name:
+            raise ExcelEngineError(f"找不到要复制的表页：{code}")
+
+        # 清掉同名旧页（反复生成时可能残留），避免 Excel 自动改名
+        for i in range(self._wb.Sheets.Count, 0, -1):
+            if self._wb.Sheets(i).Name == new_name:
+                logger.warning("发现同名表页，先删除：%s", new_name)
+                self._wb.Sheets(i).Delete()
+
+        try:
+            src = self._wb.Sheets(src_name)
+            idx = int(src.Index)
+            src.Copy(After=src)
+            new_ws = self._wb.Sheets(idx + 1)
+            new_ws.Name = new_name
+        except Exception as exc:
+            raise ExcelEngineError(
+                f"复制表页失败（{src_name} → {new_name}）：{exc}") from exc
+
+        logger.info("已复制表页：%s → %s", src_name, new_name)
+        # 不写进 _sheet_cache：缓存键是 LK 代码，复制页没有独立代码
+        return _SheetHook(new_ws, _normalize_code(code))
+
+    def set_sheet_visible(self, sheet_name: str, visible: bool) -> None:
+        """设置表页显示/隐藏。
+
+        【为什么隐藏而不是不生成】
+            上年页给维护核查用：平时不该让财务随手改动（一改就与
+            本年 P 列对不上），但排查问题时必须能展开看。
+
+        【Visible 取值】-1=可见(xlSheetVisible)，0=隐藏(xlSheetHidden)
+        """
+        self._ensure_open()
+        try:
+            self._wb.Sheets(sheet_name).Visible = -1 if visible else 0
+            logger.info("表页 %s 已设为%s", sheet_name,
+                        "可见" if visible else "隐藏")
+        except Exception as exc:
+            raise ExcelEngineError(
+                f"设置表页可见性失败（{sheet_name}）：{exc}") from exc
+
+    def sheet_visible(self, sheet_name: str) -> bool:
+        """查询表页当前是否可见。"""
+        self._ensure_open()
+        try:
+            return int(self._wb.Sheets(sheet_name).Visible) != 0
+        except Exception:
+            return False
+
+    def register_toggle_hotkey(self, sheet_name: str,
+                               key: str = "+^H",
+                               macro_name: str = "TogglePrevSheet") -> bool:
+        """注册快捷键切换指定表页的显示/隐藏。成功返回 True。
+
+        参数 key 用 Excel 的 OnKey 记法：默认 "+^H" = Ctrl+Shift+H
+        （+ 是 Shift，^ 是 Ctrl，% 是 Alt）。
+
+        【为什么失败只返回 False，不抛异常】
+            快捷键是便利功能，不是报表正确性的组成部分。
+            它依赖 Excel 允许访问 VBA 工程，而很多现场出于安全策略
+            禁用了这一项。若抛异常，整份报表就生不成了 ——
+            代价远大于"少一个快捷键"。
+
+        【★ 为什么必须写进 Workbook_Open ★】
+            最初用 Application.OnKey 直接绑定，跑起来"成功"了。
+            但那个绑定只存在于**当前这个隐藏的 Excel 进程**里，
+            用户拿到文件打开时进程早已结束，快捷键从未生效过。
+            正确做法：写进 ThisWorkbook 的 Workbook_Open，
+            用户每次打开文件时自动重新注册。
+
+        【★ Workbook_Open 只能写在 ThisWorkbook 模块 ★】
+            写进标准模块时 Excel 既不报错也不触发，
+            表现为"宏存在，但打开文件什么都没发生"，
+            属于静默失效，比报错更难查。所以这里明确分开写。
+        """
+        self._ensure_open()
+        marker = "LK02_TOGGLE_PREV_SHEET"
+
+        # 标准模块里只放宏本体
+        vba = (
+            "' " + marker + "_MACRO\n"
+            "Sub " + macro_name + "()\n"
+            "    Dim ws As Worksheet\n"
+            "    On Error Resume Next\n"
+            "    Set ws = ThisWorkbook.Worksheets(\"" + sheet_name + "\")\n"
+            "    If ws Is Nothing Then Exit Sub\n"
+            "    If ws.Visible = xlSheetVisible Then\n"
+            "        ws.Visible = xlSheetHidden\n"
+            "    Else\n"
+            "        ws.Visible = xlSheetVisible\n"
+            "    End If\n"
+            "End Sub\n"
+        )
+        try:
+            project = self._wb.VBProject
+            # 删掉同名旧模块，避免反复生成时"模块已存在"报错
+            for comp in list(project.VBComponents):
+                if comp.Name == macro_name:
+                    project.VBComponents.Remove(comp)
+                    break
+
+            module = project.VBComponents.Add(1)   # 1 = 标准模块
+            module.Name = macro_name
+            module.CodeModule.AddFromString(vba)
+
+            # 把 OnKey 绑定写进 ThisWorkbook 的 Open 事件
+            wb_module = project.VBComponents("ThisWorkbook").CodeModule
+            count = int(wb_module.CountOfLines)
+            existing = wb_module.Lines(1, count) if count > 0 else ""
+            if marker not in existing:
+                wb_module.AddFromString(
+                    "\n' " + marker + "_OPEN\n"
+                    "Private Sub Workbook_Open()\n"
+                    "    On Error Resume Next\n"
+                    "    Application.OnKey \"" + key + "\", \""
+                    + macro_name + "\"\n"
+                    "End Sub\n"
+                )
+
+            # 当前进程也立刻生效（便于开发时验证）
+            self._excel.OnKey(key, macro_name)
+            logger.info("已注册快捷键 %s → 切换表页 %s（已写入打开事件）",
+                        key, sheet_name)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "注册快捷键失败（不影响报表生成）：%s。"
+                "常见原因：Excel 信任中心禁用了"
+                "「信任对 VBA 工程对象模型的访问」。"
+                "若需要该快捷键，请在 Excel 选项中开启后再生成一次。", exc)
+            return False
+
+    # ==================================================================
+    # 页眉保护（20261106：修复 A2/A4 显示 #REF!）
+    # ==================================================================
+    # 【为什么用"xlrd 读模板原文"兜底，而不解析公式？】
+    #   公式可能千变万化（=报表封面!B2、=INDIRECT(...)、含 IF 拼接…），
+    #   逐个解析既复杂又易漏。而 xlrd 读到的缓存值正是公式在模板保存时
+    #   的计算结果 —— 也就是人眼看到的那个文字。直接拿它恢复最可靠，
+    #   完全不需要知道公式长什么样。
+    _HEADER_ROWS = 8      # 页眉区一般在前 8 行
+    _HEADER_COLS = 8      # A~H 列足够覆盖页眉
+
+    def _snapshot_header_text(self) -> dict:
+        """用 xlrd 读出模板各页前若干行的文字，作为恢复用"原文快照"。
+
+        返回 {(工作表名, 行, 列): 文本}
+        """
+        snapshot: dict = {}
+        try:
+            import xlrd
+            book = xlrd.open_workbook(str(self.template_path))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读取模板页眉快照失败（不影响生成）：%s", exc)
+            return snapshot
+
+        for name in book.sheet_names():
+            sh = book.sheet_by_name(name)
+            rows = min(self._HEADER_ROWS, sh.nrows)
+            cols = min(self._HEADER_COLS, sh.ncols)
+            for r in range(rows):
+                for c in range(cols):
+                    # 只收文本类（xlrd 1=TEXT）。
+                    # 公式的缓存值若为文本也会是 1 —— 正是我们要的原文。
+                    if sh.cell_type(r, c) != 1:
+                        continue
+                    text = str(sh.cell_value(r, c)).strip()
+                    if text:
+                        snapshot[(name, r + 1, c + 1)] = text
+        return snapshot
+
+    def _restore_broken_header_cells(self, keep_names: set) -> int:
+        """把保留页中变成错误值的页眉格子，恢复成模板里的原文。
+
+        返回实际恢复的格子数量。
+
+        【为什么只处理页眉区（前 8 行 / A~H 列）？】
+            数据区若出现 #REF!，那是真的数据问题（取数或公式错），
+            必须让人看见，绝不能悄悄用旧值覆盖 —— 那会把"错的"
+            伪装成"对的"。页眉只是标签文字，与数据无关，坏了纯属
+            显示事故，可以安全恢复。
+        """
+        if not keep_names:
+            return 0
+
+        snapshot = self._snapshot_header_text()
+        if not snapshot:
+            return 0
+
+        restored = 0
+        for name in keep_names:
+            try:
+                ws = self._wb.Sheets(name)
+            except Exception:
+                continue
+            for r in range(1, self._HEADER_ROWS + 1):
+                for c in range(1, self._HEADER_COLS + 1):
+                    original = snapshot.get((name, r, c))
+                    if not original:
+                        continue
+                    try:
+                        cell = ws.Cells(r, c)
+                        # IsError 为真说明是错误值（#REF!/#VALUE! 等）
+                        if not bool(cell.IsError):
+                            continue
+                        cell.NumberFormat = "@"
+                        cell.Value = original
+                        restored += 1
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("恢复页眉失败（%s R%dC%d）：%s",
+                                       name, r, c, exc)
+        if restored:
+            logger.info("已恢复 %d 个损坏的页眉格子（原为 #REF! 等错误值）",
+                        restored)
+        return restored
 
     # ------------------------------------------------------------------
     # 表页访问

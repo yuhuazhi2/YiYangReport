@@ -62,14 +62,45 @@ def make_amount_rows(codes_map: dict) -> list:
     return rows
 
 
-def run_report(rows=None, month: int = 5, year: int = 2026, fail: bool = False):
-    """跑一遍 LK02 的 fetch + write，返回 (hook, ctx)。"""
-    ctx = FakeCtx(rows or [], year=year, month=month, fail=fail)
+def run_report(rows=None, month: int = 5, year: int = 2026, fail: bool = False,
+               prev_rows=None, prev_database: str = None):
+    """跑一遍 LK02 的 fetch + write，返回 (hook, ctx)。
+
+    参数：
+        rows         本年查询结果 [(ccode, iperiod, amount), ...]
+        prev_rows    上年查询结果；None = 用空列表（上年无数据）
+        prev_database  上年库名。传 "" 表示"该账套首年、无上年数据"，
+                     此时 LK02 会跳过上年取数（P 列与对比页都不填）。
+
+    【为什么要暴露 prev_rows / prev_database？】
+        20261106 起，LK02 会额外查一次上年同期数据用于 P 列。
+        不传 prev_database 的话，默认走"有上年数据"分支 ——
+        这样既有测试的行为保持不变（只是多查一次空结果），
+        而想验证 P 列的用例可以显式给 prev_rows。
+    """
+    kwargs = {}
+    if prev_database is not None:
+        kwargs["prev_database"] = prev_database
+    ctx = FakeCtx(rows or [], year=year, month=month, fail=fail,
+                  prev_rows=prev_rows, **kwargs)
     hook = FakeHook()
     rep = LK02Report()
     rep.fetch(ctx)
     rep.write(hook, ctx)
     return hook, ctx
+
+
+def _current_year_calls(ctx) -> list[dict]:
+    """只取"本年"那批查询（排除上年的，否则计数会翻倍）。
+
+    【为什么必须区分？】
+        20261106 起每次生成会查两轮：本年 + 上年，两轮 SQL 结构完全相同。
+        若测试直接数 fetch_calls，期望值会全部翻倍 ——
+        而"翻倍"这件事本身看不出任何错误，容易被误当成正常。
+        这里用 report_code 后缀区分（上年固定记为 "LK02-上年"）。
+    """
+    return [c for c in ctx.fetch_calls
+            if not c["report_code"].endswith("-上年")]
 
 
 class TestPeriodCell(unittest.TestCase):
@@ -166,8 +197,11 @@ class TestExportRevenue(unittest.TestCase):
 
         for month, cell in expect_map.items():
             with self.subTest(month=month, cell=cell):
-                # 只给该月一个特征值，其余月份无数据
-                hook, _ = run_report([("600102", month, 1000.0 * month)])
+                # 只给该月一个特征值，其余月份无数据。
+                # 【20261106 口径变更】取数区间上限 = 所选月份，
+                #   所以要看到 month 月的数，生成期间必须选到 month。
+                hook, _ = run_report([("600102", month, 1000.0 * month)],
+                                     month=month)
                 self.assertTrue(
                     approx(hook.get(cell), 1000.0 * month),
                     f"{month}月应写入 {cell}={1000.0 * month}，"
@@ -199,8 +233,9 @@ class TestExportRevenue(unittest.TestCase):
             前者说明确实没有出口收入，后者说明需要人去查。
             若统一写 0，就再也分不清了。
         """
+        # 【20261106 口径变更】要看到 7 月数据，期间必须选到 7 月。
         rows = make_amount_rows({"600102": {3: 500.0, 7: 800.0}})
-        hook, _ = run_report(rows)
+        hook, _ = run_report(rows, month=7)
 
         self.assertTrue(approx(hook.get("E10"), 500.0))   # 3月
         self.assertTrue(approx(hook.get("I10"), 800.0))   # 7月
@@ -246,31 +281,43 @@ class TestExportRevenue(unittest.TestCase):
         self.assertTrue(approx(hook.get("O10"), 2100.0),
                         f"O10 应为 2100（1~6月），实际 {hook.get('O10')}")
 
-    def test_future_months_filled_not_truncated(self):
-        """选 8 月但已录到 10 月：9、10 月照常填列，不擅自截断。
+    def test_future_months_truncated_at_selected_month(self):
+        """选 8 月但库里已录到 10 月：9、10 月**不得填列**。
 
-        【为什么不截断？】
-            选 8 月却已有 9、10 月数据，说明该账套走在期间前面
-            （提前录入或回查历史）。擅自截掉等于隐瞒已发生的事实；
-            而"按实际数据填列 + 日志提示"既完整又不误导。
+        【★ 这是 20261106 的口径变更，与旧测试相反，务必看清 ★】
 
-            【注意】这与"普通月份生成"不冲突：正常情况 9、10 月
-            还没有凭证，自然取不到数，该情形不会触发。
+            旧口径（已作废）：超出所选期间的月份照常填列。
+            新口径（现场 20261106 确认）：取数区间固定为 1 月至所选月份。
+
+        【为什么改成截断？】
+            利润表是**按期出具**的报告。"2026年8月利润表"若把已录的
+            9、10 月也填进去，这张表就不再是 8 月表，而是
+            "1~8月 + 部分9/10月"的混合体，看表的人无从分辨
+            哪几列属于本期。所以口径改为：表上只有 1 月至所选月份。
+
+        【超期数据会丢失吗？】
+            不会。财务把期间选到 10 月再生成一次，9、10 月自然出现。
         """
         rows = make_amount_rows({
-            "600102": {m: 100.0 * m for m in range(1, 11)},   # 1~10 月都有
+            "600102": {m: 100.0 * m for m in range(1, 11)},   # 库里 1~10 月都有
         })
         hook, _ = run_report(rows, month=8)
 
-        # 9、10 月必须照常写入，不能被期间截断
-        self.assertTrue(approx(hook.get("K10"), 900.0),
-                        f"K10（9月）应填 900，实际 {hook.get('K10')}")
-        self.assertTrue(approx(hook.get("L10"), 1000.0),
-                        f"L10（10月）应填 1000，实际 {hook.get('L10')}")
+        # 1~8 月照常填
+        self.assertTrue(approx(hook.get("J10"), 800.0),
+                        f"J10（8月）应填 800，实际 {hook.get('J10')}")
 
-        # 累计 = 1~10 月之和 = 5500
-        self.assertTrue(approx(hook.get("O10"), 5500.0),
-                        f"O10 应为 5500（1~10月），实际 {hook.get('O10')}")
+        # 9、10 月必须**留空**（超出所选期间）
+        self.assertIsNone(hook.get("K10"),
+                          f"K10（9月）超出所选 8 月，应留空，"
+                          f"实际 {hook.get('K10')}")
+        self.assertIsNone(hook.get("L10"),
+                          f"L10（10月）超出所选 8 月，应留空，"
+                          f"实际 {hook.get('L10')}")
+
+        # 累计 = 1~8 月之和 = 3600
+        self.assertTrue(approx(hook.get("O10"), 3600.0),
+                        f"O10 应为 3600（1~8月），实际 {hook.get('O10')}")
 
     def test_non_consecutive_months(self):
         """月份不连续（1、2、5 月有数）时，只填这三个月。
@@ -323,7 +370,7 @@ class TestExportRevenue(unittest.TestCase):
             ("600102", 5, 250.0),   # 同月第二条
             ("600102", 6, 70.0),
         ]
-        hook, _ = run_report(rows)
+        hook, _ = run_report(rows, month=6)
 
         self.assertTrue(approx(hook.get("G10"), 350.0),
                         f"5月应为 100+250=350，实际 {hook.get('G10')}")
@@ -375,8 +422,11 @@ class TestExportRevenue(unittest.TestCase):
         """
         _, ctx = run_report([])
 
-        # 找出所有 SUM(md) 的查询（收入组）
-        income_calls = [c for c in ctx.fetch_calls if "SUM(md) AS amount" in c["sql"]]
+        # 找出所有 SUM(md) 的查询（收入组）。
+        # 【只统计本年】20261106 起会额外查一次上年，SQL 结构相同，
+        #   不排除的话期望值会变成 2，而"2 条"本身看不出任何错误。
+        income_calls = [c for c in _current_year_calls(ctx)
+                        if "SUM(md) AS amount" in c["sql"]]
         self.assertEqual(
             len(income_calls), 1,
             f"所有收入行应合并在同一个 SUM(md) 查询里，"
@@ -396,7 +446,9 @@ class TestExportRevenue(unittest.TestCase):
         【参数顺序（对应 SQL 里 ? 出现顺序）】
             ① iyear              目标年度，如 2026
             ② iYPeriod 下限      如 202601（1月）
-            ③ iYPeriod 上限      如 202612（12月）
+            ③ iYPeriod 上限      如 202605（= 所选月份）
+              【20261106 口径变更】上限不再是固定的 12 月，
+              而是操作人选定的月份 —— 选 5 月就只取到 202605。
             ④… ccode 列表
             … cdigest 关键字（带 %）
             … ccode_equal 列表
@@ -406,7 +458,9 @@ class TestExportRevenue(unittest.TestCase):
 
         self.assertEqual(params[0], 2026, "第1个参数应为年度 iyear")
         self.assertEqual(params[1], 202601, "第2个参数应为 iYPeriod 下限")
-        self.assertEqual(params[2], 202612, "第3个参数应为 iYPeriod 上限")
+        # 本用例默认 month=5 → 上限 202605
+        self.assertEqual(params[2], 202605,
+                         "第3个参数应为 iYPeriod 上限 = 所选月份")
         # 【为什么不再断言 params[3] 是某一个固定科目？】
         #   出口(600102)与内销(600101)口径完全相同，会被合并成同一组，
         #   SQL 里变成 `ccode IN ('600101','600102')`。
@@ -672,7 +726,8 @@ class TestDomesticRevenue(unittest.TestCase):
         _, ctx = run_report([])
 
         # 只看收入组（SUM(md)），因为成本行是另一组
-        income_calls = [c for c in ctx.fetch_calls if "SUM(md) AS amount" in c["sql"]]
+        income_calls = [c for c in _current_year_calls(ctx)
+                        if "SUM(md) AS amount" in c["sql"]]
         self.assertEqual(
             len(income_calls), 1,
             f"出口与内销口径相同，应在同一个收入组查询里，"
@@ -816,7 +871,8 @@ class TestOtherBusinessRevenue(unittest.TestCase):
         """
         _, ctx = run_report([])
 
-        income_calls = [c for c in ctx.fetch_calls if "SUM(md) AS amount" in c["sql"]]
+        income_calls = [c for c in _current_year_calls(ctx)
+                        if "SUM(md) AS amount" in c["sql"]]
         self.assertEqual(
             len(income_calls), 1,
             f"三个收入科目应合并为 1 条 SUM(md) 查询，"
@@ -962,7 +1018,7 @@ class TestExportCost(unittest.TestCase):
         _, ctx = run_report([])
 
         # 成本行与收入行方向不同 → 分组键不同 → 两次查询
-        sqls = [c["sql"] for c in ctx.fetch_calls]
+        sqls = [c["sql"] for c in _current_year_calls(ctx)]
 
         self.assertTrue(
             any("SUM(mc) AS amount" in s for s in sqls),
@@ -993,10 +1049,13 @@ class TestExportCost(unittest.TestCase):
         #   需求第 11 条新增 6117 其他收益，direction="signed"，
         #   它走独立取数函数（同时取 md 与 mc），与收入组/成本组都不同
         #   → 共 3 组查询：debit / credit / signed。
+        # 【20261106】上年对比会再来一轮同样的查询，总计翻倍。
+        #   这里只数本年的，否则期望值变成 6，"翻倍"反而掩盖真实错误。
+        calls = _current_year_calls(ctx)
         self.assertEqual(
-            len(ctx.fetch_calls), 3,
+            len(calls), 3,
             f"收入组(debit)、成本组(credit)、方向不定组(signed) 各 1 次，"
-            f"共 3 次查询，实际 {len(ctx.fetch_calls)} 次")
+            f"共 3 次查询，实际 {len(calls)} 次")
 
     def test_excel_row_mapping_for_cost(self):
         """出口主营业务成本对应 Excel 第 14 行（行次 6）。
@@ -1251,7 +1310,8 @@ class TestTaxAndSellingExpense(unittest.TestCase):
         """所有成本费用行合并在同一次 SUM(mc) 查询。"""
         _, ctx = run_report([])
 
-        cost_calls = [c for c in ctx.fetch_calls if "SUM(mc) AS amount" in c["sql"]]
+        cost_calls = [c for c in _current_year_calls(ctx)
+                      if "SUM(mc) AS amount" in c["sql"]]
         self.assertEqual(
             len(cost_calls), 1,
             f"所有成本费用行应合并为 1 条 SUM(mc) 查询，"
@@ -1715,7 +1775,7 @@ class TestOtherIncome(unittest.TestCase):
         _, ctx = run_report([])
 
         signed_calls = [
-            c for c in ctx.fetch_calls
+            c for c in _current_year_calls(ctx)
             if "debit_amount" in c["sql"] and "credit_amount" in c["sql"]
         ]
         self.assertEqual(

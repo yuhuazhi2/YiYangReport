@@ -23,21 +23,51 @@ from __future__ import annotations
 from core.context import Period
 
 
+# 测试里用的"本年库名" / "上年库名"。
+# 【为什么要给假库名，而不是留空？】
+#   LK02 的上年取数逻辑会先判断 ctx.prev_database 是否为空：
+#   为空就跳过上年查询（视为首年）。若测试里也留空，
+#   那些想验证"上年能取到数"的用例就永远走不到取数分支。
+TARGET_DB = "UFDATA_001_2026"
+PREV_DB = "UFDATA_001_2025"
+# 【默认"无上年数据"】
+#   绝大多数既有测试只关心"本年怎么填"，不关心 P 列。
+#   若默认给一个上年库，每次生成都会多查一轮，所有"查询次数"断言
+#   都会被翻倍打断 —— 而那些断言本身是对的，只是不该被上年打扰。
+#   所以默认 prev_database=""（等价于账套首年），
+#   需要验证上年功能的用例显式传 prev_database=PREV_DB。
+NO_PREV_DB = ""
+
+
 class FakeCtx:
     """假的报表上下文：fetch() 返回预设的行,不做任何数据库操作。
 
     参数：
-        rows  : 模拟的查询结果,形如 [(ccode, iperiod, mb, me), ...]
-        year  : 会计年度（默认 2026）
-        month : 会计期间月份（默认 5）
-        fail  : 为 True 时 fetch 抛异常,用于测"取数失败"的容错路径
+        rows       : 本年查询结果,形如 [(ccode, iperiod, amount), ...]
+        year       : 会计年度（默认 2026）
+        month      : 会计期间月份（默认 5）
+        fail       : 为 True 时 fetch 抛异常,用于测"取数失败"的容错路径
+        prev_rows  : 上年查询结果。None = 该账套无上年数据（prev_database 为空）
+        prev_fail  : 为 True 时"查上年库"的那次 fetch 抛异常
+
+    【为什么把本年和上年的假数据分开？】
+        两年查的是不同的库、不同的年度，返回的必然是不同批次数据。
+        若共用一个列表，就测不出"P 列取的是上年而不是本年"这类关键错误 ——
+        而这正是本功能最需要守住的地方。
     """
 
     def __init__(self, rows, year: int = 2026, month: int = 5,
-                 fail: bool = False):
+                 fail: bool = False,
+                 prev_rows=None, prev_fail: bool = False,
+                 target_database: str = TARGET_DB,
+                 prev_database: str = NO_PREV_DB):
         self.period = Period(year, month)
         self._rows = rows
         self._fail = fail
+        self._prev_rows = prev_rows
+        self._prev_fail = prev_fail
+        self.target_database = target_database
+        self.prev_database = prev_database
         # 记录每次 fetch 的调用信息,便于断言"查了哪些科目"
         self.fetch_calls: list[dict] = []
 
@@ -51,8 +81,21 @@ class FakeCtx:
             "key": key,
             "sql": sql,
             "params": params,
+            "database": database,
             "report_code": report_code,
         })
+        # 【靠 report_code 区分本年和上年】
+        #   生产代码里上年那批查询固定记为 "LK02-上年"。
+        #   用这个后缀判断，比"看 database 是不是 PREV_DB"更直接，
+        #   因为测试也可能故意把两者设成同一个库（跨年度单库场景）。
+        is_prev = report_code.endswith("-上年")
+        if is_prev:
+            if self._prev_fail:
+                raise RuntimeError("模拟上年取数失败")
+            if self._prev_rows is None:
+                return []
+            return list(self._prev_rows)
+
         if self._fail:
             raise RuntimeError("模拟取数失败")
         return list(self._rows)

@@ -661,6 +661,15 @@ class MainWindow(QMainWindow):
             self._log("[失败表页]")
             for code, err in result.failed.items():
                 self._log(f"  {code}: {err}")
+
+        # 【附加说明】如"上年对比页已生成并隐藏，按 Ctrl+Shift+H 切换"。
+        #   为什么写进日志而不是客户区？
+        #     上年页是给维护人员核查用的，普通财务不需要知道它存在；
+        #     写进日志既能留痕，又不会让主界面变得复杂。
+        if getattr(result, "notes", None):
+            self._log("[附加说明]")
+            for note in result.notes:
+                self._log(f"  {note}")
             # 【新手必学：给用户"下一步该做什么"，而不是只报个错】
             #   普通财务人员看到"某某表失败"之后，最需要知道的是：
             #     1. 这跟我有没有关系（要不要我重新操作）；

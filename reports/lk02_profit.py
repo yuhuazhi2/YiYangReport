@@ -66,11 +66,15 @@ LK02 利润表
        同理，模板中任何"整行都有 0.0/公式"的格子，若后续确认属公式行，
        一律登记进 FORMULA_ROWS，不写入数值。
 
-    ② 明细行填数范围：**1~12 月各月列（C~N）+ 本年累计（O）**
+    ② 明细行填数范围：**1 月至所选月份的月列（C~G…）+ 本年累计（O）**
+       · 【20261106 口径变更】取数区间上限 = 操作人选定的月份。
+         选 2026年5月 → 只取 1~5 月，6~12 月不查、不填。
+         原"超出所选期间照常填列"的旧口径作废（见下方口径⑤）；
        · 某月无数据时该月格保持空白（不写 0）——与 LK01 的约定一致；
-       · O 列 = 各"有数据的月份"之和（不写死 1~12 一定都有），
+       · O 列 = 各"有数据的月份"之和（不写死 1~N 一定都有），
          因此 5 月生成时 O 自然等于 1~5 月合计，无需额外判断期间；
-       · P 列（上年同期累计数）暂不填，待需求明确后处理。
+       · P 列（上年同期累计数）= **上年同表同行的 O 列**，
+         即上年 1 月至同一月份的发生额合计（见下方口径⑥）。
 
     ③ 取数类型为**本期发生额**（不是余额），且方向按行声明：
        · `direction="debit"`  → 取 md（借方金额）
@@ -106,28 +110,60 @@ LK02 利润表
     ④ 数据源为 GL_accvouch（凭证分录），不是 GL_accsum（科目汇总）。
        原因见下方「取数路线」说明与 docs/GL_accvouch字段补充说明.md。
 
-    ⑤ **月份覆盖不假设连续**（现场提醒 20261103）
+    ⑤ **月份覆盖不假设连续**（现场提醒 20261103，口径 20261106 修订）
+
        实务中"操作期间"与"凭证实际录完月份"不是一回事：
          · 常见：选 8 月、凭证录到 8 月 → 1~8 月都有数
          · 漏结转：选 8 月，但 7、8 月未做结转损益 → 只有 1~6 月有数
-         · 回查/补录：选 8 月，却已录了 9、10 月，或回补了 3 月
+         · 补录：选 8 月，却回补了 3 月的凭证
 
        程序的处理：
+         · 取数区间固定为 **1 月至所选月份**（SQL 里 iYPeriod 上限
+           就是所选月份），6 月以后的数据**不再取回**；
          · 逐月独立判断，**绝不假设"1~N 月连续有数"**；
          · 缺月保持空白（不写 0）——与 LK01 约定一致；
-         · 超出所选期间的月份**照常填列**（真实数据不擅自截断，
-           见开发口径②"1~12 列有实际数的都要填列"）；
-         · 取数完成后做覆盖诊断，把"缺哪几个月""哪几个月超出期间"
-           写进日志，让财务一眼分辨"某月为空"是漏结转还是真没业务。
+         · 取数完成后做覆盖诊断，把"缺哪几个月"写进日志，
+           让财务一眼分辨"某月为空"是漏结转还是真没业务。
 
-        【为什么超期数据不截断？】
-           若选 8 月却已录到 10 月，说明该账套走在期间前面。
-           擅自把 9、10 月截掉等于隐瞒已发生的事实；
-           而"按实际数据填列 + 日志提示"，既完整又不误导。
+       【★ 为什么上限改为所选月份？（20261106 需求）】
+           利润表是**按期出具**的报告。"2026年5月利润表"若把 6~10 月
+           已录数据也填进去，这张表就不再是 5 月表，而是"本年至今 +
+           部分未来"的混合体 —— 看表的人无从分辨哪几列属于本期。
+           所以口径改为：表上只有 1 月至所选月份，边界清晰。
 
-        【为什么程序不能自己判断"该有几个月数据"？】
-           只有财务知道本月凭证是否已录完。程序若擅自补 0 或截断，
-           都是在替财务下结论 —— 而这两种结论都可能是错的。
+       【这样改之后，超期数据会丢失吗？】
+           不会。财务把期间选到 10 月再生成一次，6~10 月自然出现。
+           即"要看哪几个月，就把期间选到哪个月"，不需要程序去猜。
+
+       【为什么程序不能自己判断"该有几个月数据"？】
+           只有财务知道本月凭证是否已录完。程序若擅自补 0，
+           等于谎报"该月无业务"。缺月一律留空，由诊断日志提示。
+
+    ⑥ **上年同期：P 列 + 隐藏的上年对比页**（20261106 需求）
+
+       【要解决什么问题？】
+           本年利润表的 P 列叫"上年同期累计数"，需要与上年同期对比。
+           该数不能靠本年数据推算，必须真的去查上一年度的账。
+
+       【怎么取？】
+         · 上一年度库由 ctx.prev_database 给出（core/u8_account.py 已解析，
+           可能是同一个库——跨年度单库，也可能是另一个库——分年度多库）；
+         · 用**与本年完全相同的取数方法与口径**，只是把年度换成 year-1，
+           月份同样取 1 月至所选月份；
+         · 因此"上年 1~5 月合计"直接就是本年 P 列要的数。
+
+       【本年页 P 列的填法】
+           本表每一行的 P 列 = 上年同表同行的 **O 列（上年累计）**。
+           若上年该行无数据，P 列留空（不写 0）—— 与全表"无数据留空"
+           的约定一致；写 0 会被误读成"上年该项确为零"。
+
+       【上年对比页】
+         · 由框架在生成本表时**复制一份本表页**得到（见 excel_engine
+           的 copy_sheet），页名加后缀「(上年)」；
+         · 内容 = 上年数据填在同样的 C~N 月列与 O 列；
+         · **不填 P 列** —— 上年页没有"上年同期"可比，留空；
+         · 默认**隐藏**（Visible=False），避免财务误操作；
+         · 用快捷键 Ctrl+Shift+H 切换显示/隐藏，便于维护时展开核查。
 
 【取数路线：为什么选 GL_accvouch】
 
@@ -1156,6 +1192,15 @@ class LK02Report(BaseReport):
     #   这是已知行为（与 LK01 的 C4 完全一致），不影响其他指标。
     cell_map = _make_cell_map()
 
+    # 上年对比页的页名后缀。框架看到这个属性非空，
+    # 就会在生成本表后复制一份本表页，用它填上年数据并隐藏。
+    # 【为什么放在报表类上，而不是写在 generator 里？】
+    #   是否需要上年对比页，是"这张表"的业务属性 ——
+    #   有的表需要（利润表），有的表不需要（资产负债表本身已含年初列）。
+    #   写在报表类上，generator 只要统一检查这个属性即可，
+    #   将来别的表也需要时，加一行属性就行，不用改 generator。
+    prev_sheet_suffix = "(上年)"
+
     def __init__(self):
         super().__init__()
         # {row_key: {month: amount}} —— 各月取数结果
@@ -1172,29 +1217,101 @@ class LK02Report(BaseReport):
         # {row_key: 是否用了备用科目} —— 供日志说明"这行数来自哪个科目"
         self.row_fallback_used: dict[str, bool] = {}
 
+        # ---- 上年同期数据（20261106 新增）----
+        # 结构与 row_values / row_has 完全一致，但年度是 year - 1。
+        # 【为什么不复用同一套容器？】
+        #   两者要同时存在：本年的 O 列用本年的值，
+        #   本年的 P 列用上年的值。若共用一个容器，
+        #   取完上年就把本年覆盖掉了。
+        self.prev_row_values: dict[str, dict[int, float]] = {}
+        self.prev_row_has: dict[str, set[int]] = {}
+        # 上年数据是否真的取到了（False 表示该账套首年，无上年可比）
+        self.has_prev_data: bool = False
+
     # ------------------------------------------------------------------
     # 第1步：取数
     # ------------------------------------------------------------------
     def fetch(self, ctx: ReportContext) -> None:
-        """按"筛选条件分组"批量取数，再按行分流汇总。
+        """取本年数据 + 取上年同期数据（20261106 扩展）。
 
-        【为什么按筛选条件分组，而不是每行一次查询？】
-            本表多数行共用同一套口径（同样的摘要关键字、同样的对方科目），
-            只是科目编码不同。把口径相同的行合并成一次查询，
-            既能减少数据库往返，也保证同组数据来自同一快照。
+        【整体流程】
+            ① 取本年 1 月至所选月份 → self.row_values / row_has
+            ② 取上年同期（同样的 1 月至所选月份）→ prev_row_values / prev_row_has
+            ③ 本年页的 O 列用 ①，P 列用 ②的合计（见 write）
+            ④ 上年对比页（若框架要求）也由 ②填出（见 write_prev_sheet）
 
-            【分组键必须是什么？】
-            direction + digest_keywords + equal_codes，三者缺一不可。
-            少一个都会把口径不同的行混进同一批数据，
-            结果错但不报错 —— 这类错误在报表上看不出任何异常。
+        【为什么两年都用同一个 _collect？】
+            两年的取数口径必须**完全一致**，否则 P 列与本表 O 列不可比。
+            若各写一套，日后改口径只改了一处，就会出现
+            "本年按新口径、上年按旧口径"的隐性不一致 —— 报表上完全看不出。
         """
-        year = ctx.period.year
-        month = ctx.period.month
-
         if not ROW_SPECS:
             logger.info("[%s] 暂无明细行项目配置，跳过取数", self.code)
             return
 
+        year = ctx.period.year
+        month = ctx.period.month
+
+        # ---- ① 本年 ----
+        values, has = self._collect(ctx, year, month,
+                                    ctx.target_database, self.code)
+        self.row_values = values
+        self.row_has = has
+        self._log_rows(values, has, tag="")
+        self._diagnose_month_coverage(month)
+
+        # ---- ② 上年同期 ----
+        # 【为什么先判断 prev_database 是否为空？】
+        #   为空表示"该账套首年、没有上年数据"（core/u8_account.py 已判定）。
+        #   此时不该去查库：查也查不到，还会白白刷出一堆"整年无记录"的
+        #   警告，把真正的问题淹没。
+        if not ctx.prev_database:
+            logger.info(
+                "[%s] 该账套无上年数据（首年），P 列与上年对比页留空。",
+                self.code)
+            return
+
+        try:
+            pv, ph = self._collect(ctx, year - 1, month,
+                                   ctx.prev_database, f"{self.code}-上年")
+        except Exception as exc:  # noqa: BLE001
+            # 【为什么这里要单独兜底？】
+            #   本年数据已经取到了，不能因为"上年库读失败"就把本表整张作废。
+            #   上年数据缺失只影响 P 列与对比页，属可降级范围。
+            logger.warning("[%s] 取上年同期数据失败，P 列留空：%s",
+                           self.code, exc)
+            return
+
+        self.prev_row_values = pv
+        self.prev_row_has = ph
+        self.has_prev_data = any(ph.values())
+        self._log_rows(pv, ph, tag="[上年]")
+
+    def _collect(self, ctx: ReportContext, year: int, month: int,
+                 database: str, report_code: str
+                 ) -> tuple[dict[str, dict[int, float]], dict[str, set[int]]]:
+        """按"筛选条件分组"批量取数，再按行分流汇总（本年/上年共用）。
+
+        返回 (values, has)：
+            values : {row_key: {month: amount}}
+            has    : {row_key: 有数据的月份集合}
+
+        【为什么抽成独立方法，参数带 year/month/database？】
+            上年同期必须用"同样的口径、不同的年度和库"取一遍。
+            抽出来后，本年与上年走的是**同一段代码**，口径不可能不一致。
+
+        【为什么 report_code 也要当参数？】
+            ctx.fetch 会把 report_code 写进 SQL 审计日志。
+            上年那批查询若仍记作 "LK02"，出问题时无法分辨
+            哪几条 SQL 查的是上年库 —— 记为 "LK02-上年" 一眼可辨。
+
+        【为什么分组键必须含 direction + digest + equal_codes？】
+            direction ：收入取 md、成本取 mc，方向不同不能混一组；
+            digest    ：摘要筛选条件不同，混了就取错数；
+            equal_codes：对方科目不同，混了同样取错数。
+            少任何一个，都会把口径不同的行并进同一批数据 ——
+            结果错但不报错，报表上完全看不出异常。
+        """
         # ---- 按筛选条件分组 ----
         #
         # 【分组键包含 direction】
@@ -1270,11 +1387,19 @@ class LK02Report(BaseReport):
             #   与 SUM(mc)，再按 md - mc 折算成带符号净额。
             #   若也用 gl_profit_amount_by_period（只 SUM 一列），
             #   当该科目出现在另一侧时取到 0，本行空白 —— 静默漏数。
+            # 【end_month = month】取数上限就是操作人选定的月份。
+            #   【为什么传 month 而不是固定 12？】
+            #     需求 20261106 明确："选取 2026 年 5 月，则查询填列
+            #     1 月到 5 月的数据"。若这里仍取 12 月，
+            #     SQL 会把 6~12 月也取回来，虽然 write 只写前 5 列，
+            #     但一旦日后有人放宽 write 的判断，超期数据就会漏出来。
+            #     在取数层就截断，是更靠前、更难被绕过的防线。
             if direction == "signed":
                 sql, params = u8.gl_profit_signed_amount(
                     year, all_codes,
                     digest_keywords=digests,
                     equal_codes=equals,
+                    end_month=month,
                 )
             else:
                 sql, params = u8.gl_profit_amount_by_period(
@@ -1282,13 +1407,19 @@ class LK02Report(BaseReport):
                     amount_side=direction,
                     digest_keywords=digests,
                     equal_codes=equals,
+                    end_month=month,
                 )
 
             try:
-                rows = ctx.fetch(key, sql, params, report_code=self.code)
+                # 【database=database】本年传 ctx.target_database，
+                #   上年传 ctx.prev_database —— 两者可能相同（跨年度单库），
+                #   也可能不同（分年度多库），由调用方决定，这里不判断。
+                rows = ctx.fetch(key, sql, params,
+                                 database=database,
+                                 report_code=report_code)
             except Exception as exc:  # noqa: BLE001
                 # 单表取数失败不中断整体流程（43 张表里坏 1 张不牵连其他）
-                logger.warning("[%s] 取数失败：%s", self.code, exc)
+                logger.warning("[%s] 取数失败：%s", report_code, exc)
                 rows = []
 
             # 科目 → [(所属行, 符号, 是否备用)]
@@ -1328,20 +1459,33 @@ class LK02Report(BaseReport):
                                 "贷方 %.2f 同时存在，与"
                                 "「唯一方向出现」的现场口径不符，"
                                 "已按净额 %.2f 填列，请核对原始凭证。",
-                                self.code, ccode, ccode, iperiod,
+                                report_code, ccode, ccode, iperiod,
                                 md_amt, mc_amt, amount,
                             )
                     else:
                         amount = float(row[2]) if row[2] is not None else 0.0
                 except (IndexError, TypeError, ValueError) as exc:
-                    logger.warning("[%s] 跳过异常记录 %r：%s", self.code, row, exc)
+                    logger.warning("[%s] 跳过异常记录 %r：%s",
+                                   report_code, row, exc)
                     continue
 
                 if not 1 <= iperiod <= 12:
                     # 出现 13 期（U8 支持调整期）等情形时明确跳过，
                     # 不静默丢弃 —— 否则"某月没数"永远查不出原因。
                     logger.warning("[%s] 跳过非法会计期间 iperiod=%s（科目 %s）",
-                                   self.code, iperiod, ccode)
+                                   report_code, iperiod, ccode)
+                    continue
+
+                # 【额外防线：月份不得超过所选月份】
+                #   SQL 里已用 end_month 限制了 iYPeriod 上限，
+                #   正常不会出现超期数据。这里再判一次属于"纵深防御"：
+                #   万一将来有人误改了取数函数的区间，也不会让 6~12 月
+                #   的数悄悄混进"5 月报表"。
+                if iperiod > month:
+                    logger.warning(
+                        "[%s] 跳过超出所选期间（%d月）的记录：科目 %s，%d月。"
+                        "取数 SQL 本应已排除该月份，若频繁出现请检查取数函数。",
+                        report_code, month, ccode, iperiod)
                     continue
 
                 for spec, sign, is_fb in code_to_rows.get(ccode, []):
@@ -1387,35 +1531,52 @@ class LK02Report(BaseReport):
         #     与"科目不存在才替代"的原始意图不符。
         #     若某月主科目无记录，那是"该月未结转"，应留空 ——
         #     宁可留空也不要用一级科目去补，否则会凭空多出金额。
-        self.row_fallback_used: dict[str, bool] = {}
+        # 【注意：这里写的是局部字典 fb_used，不是 self.row_fallback_used】
+        #   上年那次 _collect 若也直接改 self.row_fallback_used，
+        #   就会把本年的降级标记覆盖掉 —— 而本年的日志已经打过了，
+        #   覆盖只会让"本年到底有没有降级"变得不可查。
+        fb_used: dict[str, bool] = {}
         for spec in ROW_SPECS:
             main_ok = has.get(spec.key, set())
             if main_ok or not spec.fallback_codes:
-                self.row_fallback_used[spec.key] = False
+                fb_used[spec.key] = False
                 continue
 
             fb_ok = fb_has.get(spec.key, set())
             if not fb_ok:
                 # 主、备都没有数据 → 保持空白（原逻辑处理）
-                self.row_fallback_used[spec.key] = False
+                fb_used[spec.key] = False
                 continue
 
             # 主科目整年无数据、备用科目有数据 → 采用备用科目
             values[spec.key] = fb_values[spec.key]
             has[spec.key] = fb_ok
-            self.row_fallback_used[spec.key] = True
+            fb_used[spec.key] = True
 
             logger.warning(
                 "[%s] %s（第%d行）：主科目 %s 整年无结转记录，"
                 "已降级使用备用科目 %s。请核对：①该明细科目是否确实未启用；"
                 "②一级科目金额是否包含其他明细（如出口成本），避免重复。",
-                self.code, spec.label, spec.excel_row,
+                report_code, spec.label, spec.excel_row,
                 "、".join(spec.codes), "、".join(spec.fallback_codes),
             )
 
-        # ---- 收口保存 + 日志 ----
-        self.row_values = values
-        self.row_has = has
+        # ---- 返回结果（由调用方决定存到"本年"还是"上年"容器）----
+        #   【为什么把 fb_used 也当返回值？】调用方需要知道"这一年的数
+        #   是否来自备用科目"，因为本年的 P 列与上年对比页都要用这个标记
+        #   在日志里说明数的来源。
+        self.last_fallback_used = fb_used
+        return values, has
+
+    def _log_rows(self, values: dict[str, dict[int, float]],
+                  has: dict[str, set[int]], tag: str = "") -> None:
+        """把取数结果逐行写进日志（本年与上年共用，靠 tag 区分）。
+
+        【为什么把日志单独抽出来？】
+            本年与上年的日志措辞应当完全一致，只有前缀不同。
+            若各写一份，就会出现"上年漏了 optional 的特殊措辞"这类
+            不一致 —— 而日志正是财务排查时唯一的线索。
+        """
 
         for spec in ROW_SPECS:
             vals = values.get(spec.key, {})
@@ -1427,17 +1588,17 @@ class LK02Report(BaseReport):
                 #   否则维护者会对警告脱敏，真正的问题被淹没。
                 if spec.optional:
                     logger.info(
-                        "[%s] %s（第%d行）：科目 %s 尚无结转记录，本行留空。"
+                        "[%s]%s %s（第%d行）：科目 %s 尚无结转记录，本行留空。"
                         "（该科目现场标注为「暂未启用」，属预期状态）",
-                        self.code, spec.label, spec.excel_row,
+                        self.code, tag, spec.label, spec.excel_row,
                         "、".join(spec.codes),
                     )
                 else:
                     logger.warning(
-                        "[%s] %s（第%d行）：整年未取到符合条件的记录，全部保持空白。"
+                        "[%s]%s %s（第%d行）：未取到符合条件的记录，本行留空。"
                         "请检查：①科目 %s 是否使用；②摘要是否含 %s；"
                         "③对方科目是否为 %s",
-                        self.code, spec.label, spec.excel_row,
+                        self.code, tag, spec.label, spec.excel_row,
                         "、".join(spec.codes),
                         "、".join(spec.digest_keywords) or "（不限）",
                         "、".join(spec.equal_codes) or "（不限）",
@@ -1448,14 +1609,11 @@ class LK02Report(BaseReport):
             # optional 行一旦有数，明确提示"已开始使用"，
             # 让财务注意到这个科目已在账上启用（可能是新开的科目）。
             if spec.optional:
-                logger.info("[%s] %s（第%d行）已开始使用，取到：%s",
-                            self.code, spec.label, spec.excel_row, detail)
+                logger.info("[%s]%s %s（第%d行）已开始使用，取到：%s",
+                            self.code, tag, spec.label, spec.excel_row, detail)
             else:
-                logger.info("[%s] %s（第%d行）：%s",
-                            self.code, spec.label, spec.excel_row, detail)
-
-        # ---- 月份覆盖诊断（只记日志，不改变已算出的数据）----
-        self._diagnose_month_coverage(month)
+                logger.info("[%s]%s %s（第%d行）：%s",
+                            self.code, tag, spec.label, spec.excel_row, detail)
 
     def _diagnose_month_coverage(self, period_month: int) -> None:
         """诊断各行的月份覆盖情况 —— 只记日志，不改变填数行为。
@@ -1497,7 +1655,6 @@ class LK02Report(BaseReport):
             # 1~所选期间 之间，理论上都应当有结转记录
             expected = set(range(1, period_month + 1))
             missing = sorted(expected - ok)
-            future = sorted(m for m in ok if m > period_month)
 
             if missing:
                 logger.warning(
@@ -1507,20 +1664,11 @@ class LK02Report(BaseReport):
                     "、".join(f"{m}月" for m in missing),
                 )
 
-            if future:
-                logger.info(
-                    "[%s] %s（第%d行）：所选期间为 %d 月，但检测到 %s 也有数据，"
-                    "已一并填列。回查历史或提前录入属正常；"
-                    "若这些月份不应出现，请核对凭证的会计期间。",
-                    self.code, spec.label, spec.excel_row, period_month,
-                    "、".join(f"{m}月" for m in future),
-                )
-
     # ------------------------------------------------------------------
     # 第2步：填表
     # ------------------------------------------------------------------
     def write(self, hook: _SheetHook, ctx: ReportContext) -> None:
-        """填页眉 + 会计期间 + 各明细行。"""
+        """填本年页：页眉 + 会计期间 + 月列 + O 列 + P 列（上年同期累计）。"""
         # 1) 通用页眉（公司名称等）
         # 【为什么 fill_period=False？】
         #   通用页眉会把年月写回"会计期间："标签所在格（本表是 A4）。
@@ -1538,10 +1686,32 @@ class LK02Report(BaseReport):
         logger.info("[%s] 已写入 %s=%s年%s月",
                     self.code, PERIOD_CELL, ctx.period.year, ctx.period.month)
 
-        # 3) 各明细行：逐月写 + 本年累计
+        # 3) 各明细行：月列 + O 列 + P 列
+        self._write_rows(hook, self.row_values, self.row_has,
+                         fill_last_year=True)
+
+    def _write_rows(self, hook: _SheetHook,
+                    values: dict[str, dict[int, float]],
+                    has: dict[str, set[int]],
+                    fill_last_year: bool) -> None:
+        """把一组取数结果写进当前表页（本年页与上年页共用）。
+
+        参数 fill_last_year：
+            True  → 本年页，写 P 列（值 = 上年同行的 O 列累计）
+            False → 上年页，不写 P 列（它没有"上年同期"可比）
+
+        【为什么本年页最后一列要单独处理？】
+            本表 P 列的表头叫"上年同期累计数"，它的值不是"从库里查出来的
+            本年数"，而是"上年那张表的 O 列"。也就是说：
+                本年 O 列 ← 本年的月列之和
+                本年 P 列 ← 上年的月列之和（= 上年页的 O 列）
+            所以填 P 列时读的是 self.prev_row_values，不是 values。
+            若误用 values，P 列会变成"本年累计的复制"，看起来完全正常，
+            但对比意义尽失 —— 这类错误肉眼极难发现。
+        """
         for spec in ROW_SPECS:
-            vals = self.row_values.get(spec.key, {})
-            ok = self.row_has.get(spec.key, set())
+            vals = values.get(spec.key, {})
+            ok = has.get(spec.key, set())
 
             if not ok:
                 # 【为什么不写 0？】
@@ -1558,6 +1728,11 @@ class LK02Report(BaseReport):
                 if not spec.optional:
                     logger.warning("[%s] %s 无数据，整行保持空白（不写 0）",
                                    self.code, spec.label)
+                # 【注意】即使本年无数据，P 列仍要试着填：
+                #   可能本年没业务、上年有业务。这种情况 P 列应当有数，
+                #   否则"本年 0 vs 上年 5000"的对比信息就丢了。
+                if fill_last_year:
+                    self._write_last_year_cell(hook, spec)
                 continue
 
             for month, col in COL_OF_MONTH.items():
@@ -1582,3 +1757,89 @@ class LK02Report(BaseReport):
                             self.code, spec.label,
                             "、".join(f"{COL_OF_MONTH[m]}{spec.excel_row}={vals[m]:.2f}"
                                       for m in sorted(ok)))
+
+            if fill_last_year:
+                self._write_last_year_cell(hook, spec)
+
+    def _write_last_year_cell(self, hook: _SheetHook, spec: ProfitRow) -> None:
+        """写本年页的 P 列（上年同期累计数）。
+
+        【取值规则】
+            P 列 = 上年同行的 O 列 = 上年 1 月至所选月份的发生额合计。
+            若上年该行无数据 → 不写（留空），不写 0。
+
+        【为什么"无数据不写 0"在这里尤其重要？】
+            P 列是给人做同比的。写 0 意味着"上年这项确实是零"，
+            而留空意味着"上年没有这项数据"——两者在分析时结论完全不同：
+              · 上年确有 0：同比无变化或不可比，需另行说明；
+              · 上年无数据：根本没得比（如该科目上年尚未启用）。
+            程序无法替财务判断是哪一种，所以只忠实反映"有没有取到"。
+        """
+        if not self.has_prev_data:
+            return
+
+        pv = self.prev_row_values.get(spec.key, {})
+        pok = self.prev_row_has.get(spec.key, set())
+        if not pok:
+            return
+
+        prev_total = sum(pv[m] for m in pok)
+        hook.set(f"{COL_LAST_YEAR_TOTAL}{spec.excel_row}", prev_total)
+        logger.info("[%s] 已写入上年同期 %s%d=%.2f（= 上年 %d~%d 月累计）",
+                    self.code, COL_LAST_YEAR_TOTAL, spec.excel_row, prev_total,
+                    min(pok), max(pok))
+
+    # ------------------------------------------------------------------
+    # 第3步：填上年对比页（由框架复制本表页后调用）
+    # ------------------------------------------------------------------
+    def write_prev_sheet(self, hook: _SheetHook, ctx: ReportContext) -> None:
+        """填"上年对比页"：同样的版式，数据换成上一年度。
+
+        【与 write 的三处差异】
+            ① C4 写**上年**年月（如 "2025年5月"），不是本年；
+            ② 月列与 O 列填上年数据；
+            ③ **不填 P 列** —— 上年页没有"上年同期"可比。
+              模板的 P 列在复制过来的这一页里会保留本年的值，
+              必须主动清空，否则维护者展开核查时会看到
+              "上年页的 P 列显示着本年算出的上年同期数"——自相矛盾。
+        """
+        # 1) 页眉（公司名称、制表、复核等，与本年页相同）
+        fill_common_header(hook, ctx, fill_period=False)
+
+        # 2) C4 写上年年月
+        #
+        # 【若上年无数据，在年月后面直接标注】
+        #   这一格是整页最显眼的位置，也是财务看报表第一眼会看的地方。
+        #   标注在这里，维护者打开对比页立刻能分清：
+        #     · "2025年9月"                  → 有数据，正常
+        #     · "2025年9月（上年同期无数据）" → 程序查过了，2025 年确实没数
+        #   而不必再去翻日志猜测"到底是没生成还是没数据"。
+        prev_year = ctx.period.year - 1
+        period_text = f"{prev_year}年{ctx.period.month}月"
+        if not self.has_prev_data:
+            period_text += "（上年同期无数据）"
+        hook.set_text(PERIOD_CELL, period_text)
+        logger.info("[%s] 上年对比页：%s=%s",
+                    self.code, PERIOD_CELL, period_text)
+
+        # 3) 月列 + O 列（不写 P 列）
+        if self.has_prev_data:
+            self._write_rows(hook, self.prev_row_values, self.prev_row_has,
+                             fill_last_year=False)
+        else:
+            logger.info("[%s] 上年对比页：无上年数据，仅保留空白表页。",
+                        self.code)
+
+        # 4) 清空 P 列（复制过来的页沿用本年的 P 列值，必须清除）
+        #
+        # 【为什么不能只在"有上年数据"时清？】
+        #   P 列存的是"本年的上年同期"，与上年页的语义冲突。
+        #   无论有没有上年数据，上年页都不该出现 P 列数字。
+        #   写成空串而非 0：0 会被误读成"上年同期确实为零"。
+        for spec in ROW_SPECS:
+            try:
+                hook.set_text(f"{COL_LAST_YEAR_TOTAL}{spec.excel_row}", "")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("[%s] 清空上年页 P 列失败（第%d行）：%s",
+                               self.code, spec.excel_row, exc)
+                break
