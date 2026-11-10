@@ -166,6 +166,137 @@ def gl_subject_codes() -> tuple[str, list]:
     return sql, []
 
 
+def gl_cashflow_items(year: int, month: int,
+                      cash_items: tuple[str, ...]) -> tuple[str, list]:
+    """现金流量项目金额（gl_cashtable）：取某期间各现金流量项目的借贷发生额。
+
+    【数据源为什么是 gl_cashtable，不是 GL_accsum / GL_accvouch？】
+        现金流量表不是"按会计科目取余额"的表，而是 U8 在凭证里
+        标记了"现金流量项目"之后，由系统汇总到 gl_cashtable。
+        会计科目与现金流量项目不是一一对应（同一笔银行存款收付，
+        可能被标记为"销售商品收到的现金"或"收到的税费返还"），
+        所以只能用这张专门的项目表，不能从科目余额反推。
+
+    【需求现场口径（LK03 行次2 销售商品、提供劳务收到的现金，20261106 确认）】
+        ① iYPeriod = 操作界面选定的**那一个年月**，如选 2026年5月 → 202605
+           【注意】是**单月精确匹配**，不是 1 月至今的区间累计。
+           这与 LK02 利润表"取 1~N 月累计"的口径不同，切勿混用。
+        ② cCashItem = '01'
+        ③ 净额 = SUM(md) - SUM(mc)
+              md 借方金额 → 现金流入（增加）
+              mc 贷方金额 → 现金流出/冲回（减项）
+
+    【为什么同时返回借贷两列，而不是在 SQL 里算好净额？】
+        与 gl_profit_signed_amount 同一考虑：
+          · 报表层可在日志里分别列出借方、贷方合计，
+            便于财务核对"这笔为什么是负数"；
+          · 某项目若借贷同月都有值，仍是正常的（有收有退），
+            直接相减不会掩盖任何异常，但保留两列能让日志更有信息量。
+
+    【参数 cash_items】
+        本次要取的现金流量项目编码元组，如 ("01",)。
+        用**精确匹配**（IN）而非前缀匹配 —— 项目编码 01 与 0101
+        是两个不同的项目，前缀匹配会把后者也算进来。
+
+    【iYPeriod 的存储格式】
+        与 GL_accsum / GL_accvouch 一致，现场确认为**整数** YYYYMM。
+        所以下面用 int(f"{year}{month:02d}") 生成，必须转 int，
+        让参数类型与字段类型严格一致，不依赖数据库隐式转换。
+    """
+    if not cash_items:
+        raise ValueError(
+            "cash_items 不能为空：每个现金流量行至少要指定一个项目编码")
+
+    # 选定的那一个年月，如 2026 年 5 月 → 202605
+    yperiod = int(f"{year}{month:02d}")
+
+    placeholders = ", ".join("?" for _ in cash_items)
+
+    sql = f"""
+        SELECT cCashItem, iYPeriod,
+               SUM(md) AS debit_amount,
+               SUM(mc) AS credit_amount
+        FROM gl_cashtable
+        WHERE iYPeriod = ?
+          AND cCashItem IN ({placeholders})
+        GROUP BY cCashItem, iYPeriod
+        ORDER BY cCashItem
+    """
+    # 参数顺序必须与 SQL 里 ? 出现的顺序一致：
+    #   ① 年月整数   ②③… 项目编码
+    params: list[Any] = [yperiod, *cash_items]
+    return sql, params
+
+
+def gl_period_begin_balance(year: int, month: int,
+                            codes: tuple[str, ...]) -> tuple[str, list]:
+    """科目期初余额（GL_accsum.mb）：取某期间若干科目的**本月期初**余额。
+
+    【与 gl_cashflow_items 的根本区别（务必分清）】
+        gl_cashflow_items 查的是 gl_cashtable —— 现金流量**项目**
+            （cCashItem，如 '01'），带 md/mc 两侧发生额，要按方向相减。
+        gl_period_begin_balance 查的是 GL_accsum —— 会计**科目**余额
+            （ccode，如 '1001'），只有一个 mb（期初余额），没有"方向"。
+
+        两者不是同一个维度：现金流量项目由凭证上的业务标记决定，
+        科目余额由总账凭证汇总而来。放到同一张表里取数会串错。
+
+    【需求现场口径（LK03 行次37 期初现金及现金等价物余额，20261110 确认）】
+        ① 数据源 GL_accsum
+        ② iYPeriod = 界面选定的**那一个年月**（单月精确匹配，与
+           gl_cashflow_items 同一口径；不是 1 月至该月的区间累计）
+        ③ ccode IN ('1001', '1002') —— 库存现金 + 银行存款
+        ④ 取 mb（期初余额）字段，对命中的科目做汇总
+        ⑤ C45 取所选年月；D45 取上一期（1 月则跨年到上年 12 月）
+
+    【★ 为什么 mb 就是"本月的期初余额"？★】
+        GL_accsum 里每个科目每个月各有一行，该行的 mb 表示
+        "该期间开始时该科目的余额"，等价于上月末余额。
+        所以选 202605 时取到的 mb 就是"2026年5月初货币资金余额"，
+        正是现金流量表"期初现金及现金等价物余额"要填的数。
+
+        【与 LK01 的差别：那边要的是"年初余额"】
+            LK01 资产负债表 D 列要的是"上年年末余额"，
+            只能取**本年 1 月那条记录**的 mb（详见 gl_balance_by_codes
+            里对 mb 语义随月份变化的说明）。
+            本函数只取"所选期间"那一条，不做跨期间合并。
+
+    【为什么返回明细（ccode, iYPeriod, mb）而不是 SUM(mb)？】
+        ① 日志里可以列出"这个数由哪几个科目构成"，便于与用友前台逐项对账；
+        ② 报表层可再判一次 iYPeriod 是否等于期望年月（纵深防御），
+           避免脏数据静默混入 —— 而报表上只是个数字，看不出月份错位。
+
+        数据量最多 2 行（1001、1002），代价可忽略。
+
+    【参数 codes】
+        科目编码元组，**精确匹配**（IN）。
+        需求原文为"ccode 是 1001、1002 的记录"，故不做前缀匹配；
+        若将来口径改为"含明细科目"，应在此显式改 LIKE 并同步改测试。
+
+    【iYPeriod 的存储格式】
+        与 gl_cashflow_items 一致，现场确认为**整数** YYYYMM，
+        故显式 int()，让参数类型与字段类型严格一致，不依赖隐式转换。
+    """
+    if not codes:
+        raise ValueError(
+            "codes 不能为空：余额类行至少要指定一个会计科目")
+
+    yperiod = int(f"{year}{month:02d}")
+    placeholders = ", ".join("?" for _ in codes)
+
+    sql = f"""
+        SELECT ccode, iYPeriod, mb
+        FROM GL_accsum
+        WHERE iYPeriod = ?
+          AND ccode IN ({placeholders})
+        ORDER BY ccode
+    """
+    # 参数顺序必须与 SQL 里 ? 出现的顺序一致：
+    #   ① 年月整数   ②③… 科目编码
+    params: list[Any] = [yperiod, *codes]
+    return sql, params
+
+
 # ---------------------------------------------------------------------------
 # 二、货币资金 / 票据
 # ---------------------------------------------------------------------------
