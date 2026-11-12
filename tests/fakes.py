@@ -164,6 +164,9 @@ class FakeHook:
         #   而值本身不变。若只记录 written，就测不出
         #   "格式有没有被改对" —— 而这正是本次修复的全部内容。
         self.number_formats: dict[str, str] = {}
+        # {单元格地址: 写入的公式文本}
+        # 【与 written 分开存】理由见 set_formula 的说明。
+        self.formulas: dict[str, str] = {}
         # 记录写入顺序,便于验证"先设格式再写值"这类顺序要求
         self.events: list[tuple] = []
         # {单元格地址: 公式计算结果}
@@ -181,6 +184,21 @@ class FakeHook:
     def set(self, cell: str, value) -> None:
         self.written[cell] = value
         self.events.append(("set", cell, value))
+
+    def set_formula(self, cell: str, formula: str) -> None:
+        """记录公式写入（对应 _SheetHook.set_formula）。
+
+        【为什么要单独记到 formulas 里，而不是混进 written？】
+            真实 Excel 里"写公式"与"写值"是两条不同的路径：
+              · 写值 → 公式被**覆盖**（自动汇总能力丢失）
+              · 写公式 → 公式仍在，Excel 每次重算都会更新
+            报表测试需要区分这两种情形 ——
+            例如"合计行必须写公式、不能写值"这条约束，
+            若混在一起就验不出来。
+        """
+        self.formulas[cell] = formula
+        self.written[cell] = formula
+        self.events.append(("set_formula", cell, formula))
 
     def set_rc(self, row: int, col: int, value) -> None:
         self.set(f"{col_letter(col)}{row}", value)
